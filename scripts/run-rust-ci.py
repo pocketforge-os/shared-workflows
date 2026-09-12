@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -142,6 +143,35 @@ def archive(path, sha, destination):
         subprocess.run(["git", "-C", str(path), "archive", sha], stdout=stream, check=True)
 
 
+def disk_usage(root):
+    """Allocated bytes during compilation; vanished intermediates are normal.
+
+    GNU du exits nonzero when rustc unlinks an object between readdir/stat. Do
+    not abort a healthy job for that race; other I/O errors still fail closed.
+    """
+    pending = [root]
+    seen = set()
+    total = 0
+    while pending:
+        path = pending.pop()
+        try:
+            info = path.lstat()
+            identity = (info.st_dev, info.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += info.st_blocks * 512
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(path) as entries:
+                    pending.extend(Path(entry.path) for entry in entries)
+        except FileNotFoundError:
+            if path == root:
+                raise Refused("run_disk_usage_unknown") from None
+        except OSError:
+            raise Refused("run_disk_usage_unknown") from None
+    return total
+
+
 def run(source, source_sha, platform, platform_sha, image, script, *, root=None, slot_fd=None):
     if not IMAGE.fullmatch(image):
         raise Refused("unpinned_image")
@@ -208,7 +238,7 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
         while child.poll() is None:
             # Run-private output budget; no unbounded target/cache exports. Admission
             # is conservative accounting, not an underlying filesystem hard quota.
-            used = int(output("du", "-s", "-B1", str(directory)).split()[0])
+            used = disk_usage(directory)
             if used > DISK:
                 raise Refused("run_disk_budget")
             time.sleep(2)

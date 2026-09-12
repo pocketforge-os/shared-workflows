@@ -16,6 +16,30 @@ spec.loader.exec_module(ci)
 
 
 class CapacityTests(unittest.TestCase):
+    def test_live_disk_scan_tolerates_unlinked_rustc_intermediate_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keep = root / "sibling-output"
+            keep.write_bytes(b"keep" * 1024)
+            transient = root / "rustc.rcgu.o"
+            transient.write_bytes(b"object" * 1024)
+            original = Path.lstat
+
+            def racing_stat(path):
+                if path == transient:
+                    path.unlink()  # Gone after readdir, before stat, as in real CI.
+                return original(path)
+
+            with patch.object(Path, "lstat", racing_stat):
+                self.assertGreaterEqual(ci.disk_usage(root), keep.stat().st_blocks * 512)
+            self.assertEqual(keep.read_bytes(), b"keep" * 1024)
+            self.assertFalse(transient.exists())
+            with patch.object(Path, "lstat", side_effect=PermissionError("unreadable")):
+                with self.assertRaisesRegex(ci.Refused, "run_disk_usage_unknown"):
+                    ci.disk_usage(root)
+            with self.assertRaisesRegex(ci.Refused, "run_disk_usage_unknown"):
+                ci.disk_usage(root / "missing-run")
+
     def fs(self, size=100 * ci.GIB, inodes=1000000):
         return SimpleNamespace(f_bavail=size // 4096, f_frsize=4096, f_favail=inodes)
 
