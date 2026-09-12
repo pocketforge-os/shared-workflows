@@ -1,0 +1,101 @@
+name: Pinned Rust container
+on:
+  workflow_call:
+    inputs:
+      source-sha:
+        description: Exact caller candidate or synthetic merge SHA (normally github.sha)
+        required: true
+        type: string
+      workflow-sha:
+        description: Repeat the immutable uses commit for the public helper checkout
+        required: true
+        type: string
+      image:
+        description: Published ci-rust image including sha256 digest
+        required: true
+        type: string
+      script:
+        description: Committed caller payload script (relative to repository root)
+        required: true
+        type: string
+      platform-ref:
+        description: Resolve main once for live fixture regressions, or an exact replay SHA
+        default: main
+        type: string
+      verify-controls:
+        description: Run two-slot live engine negatives during an explicit validation run
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  container:
+    name: Rust container
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, pf-ci-container]
+    timeout-minutes: 30
+    steps:
+      - name: Validate immutable identities
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          EXPECTED_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ inputs.workflow-sha }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$SOURCE_SHA" == "$EXPECTED_SHA" ]]
+          [[ "$WORKFLOW_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$IMAGE" =~ ^10\.0\.32\.86:5555/pocketforge/ci-rust@sha256:[a-f0-9]{64}$ ]]
+      - name: Checkout exact caller source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.source-sha }}
+          path: source
+          persist-credentials: false
+      - name: Checkout public helper at caller pin
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: pocketforge-os/shared-workflows
+          ref: ${{ inputs.workflow-sha }}
+          path: shared
+          persist-credentials: false
+      - name: Checkout platform fixtures
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: pocketforge-os/platform
+          ref: ${{ inputs.platform-ref }}
+          path: platform
+          persist-credentials: false
+      - name: Verify identity and admission controls
+        env:
+          IMAGE: ${{ inputs.image }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          WORKFLOW_SHA: ${{ inputs.workflow-sha }}
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C shared rev-parse HEAD)" = "$WORKFLOW_SHA"
+          python3 shared/tests/test_rust_ci.py
+      - name: Real missing-tool, concurrent-cache and cancellation controls
+        if: inputs.verify-controls
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          python3 shared/tests/live_rust_ci.py --image "$IMAGE"
+      - name: Run committed Rust payload with poisoned host task tools
+        env:
+          IMAGE: ${{ inputs.image }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          SCRIPT: ${{ inputs.script }}
+        run: |
+          poison="$(mktemp -d "$RUNNER_TEMP/rust-host-poison.XXXXXX")"
+          trap 'rm -rf "$poison"' EXIT
+          for tool in rustc cargo rustup rustfmt clippy-driver sccache gcc cc aarch64-linux-gnu-gcc aarch64-none-linux-gnu-gcc; do
+            printf '#!/bin/sh\necho "forbidden host task tool: %s" >&2\nexit 97\n' "$tool" > "$poison/$tool"
+            chmod +x "$poison/$tool"
+          done
+          platform_sha="$(git -C platform rev-parse HEAD)"
+          printf 'tested_source=%s platform=%s image=%s runner=%s\n' "$SOURCE_SHA" "$platform_sha" "$IMAGE" "$RUNNER_NAME" | tee -a "$GITHUB_STEP_SUMMARY"
+          PATH="$poison:$PATH" RUSTC_WRAPPER="$poison/sccache" \
+            python3 shared/scripts/run-rust-ci.py --source source --source-sha "$SOURCE_SHA" \
+              --platform platform --platform-sha "$platform_sha" --image "$IMAGE" --script "$SCRIPT"
