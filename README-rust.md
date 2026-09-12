@@ -59,6 +59,17 @@ the survivor's cache/output and exact-container cleanup. Enable this during
 profile validation (automation's image-profile CI does so); ordinary caller
 jobs stay parallel without each requesting a second slot for controls.
 
+The two-control cohort claims both lifetime slots atomically, with a 600-second
+bounded wait. Every unsuccessful attempt drops all partial locks and the short
+admission lock, so a normal sibling can finish and another ordinary run can use
+the spare slot. Children inherit verified real slot descriptors; a caller cannot
+substitute an unrelated FD to bypass admission. Ordinary callers also wait
+boundedly when the control cohort temporarily owns both slots. Expiry reports
+`capacity_slots_timeout` (75), without starting a partial cohort or touching
+sibling state. Profile CI's `tests/slot_contention.py` holds a real normal sibling,
+observes the waiting cohort, runs another normal job in the spare slot, then
+releases the sibling and proves the cache/cancellation controls complete.
+
 GitHub prefixes reusable checks with caller/callee names. Runtime retains its
 original check name as a fail-closed dependent result gate; the full test payload
 runs in the reusable job, and a failure/cancellation/skip cannot green that gate.

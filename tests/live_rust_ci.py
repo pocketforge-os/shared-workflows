@@ -6,6 +6,8 @@ Never changes runner tools or published image bytes. Needs only host stdlib/Git/
 Docker, just like the controller. Logs and reservations use run-private names.
 """
 import argparse
+import contextlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,9 @@ import tempfile
 import time
 
 CONTROLLER = Path(__file__).parents[1] / "scripts/run-rust-ci.py"
+spec = importlib.util.spec_from_file_location("rust_ci", CONTROLLER)
+ci = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ci)
 
 
 def checked(*args, **kwargs):
@@ -32,11 +37,7 @@ def wait_for(predicate, seconds=90):
     raise AssertionError("bounded wait expired")
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--image", required=True)
-    args = p.parse_args()
-    assert "@sha256:" in args.image
+def controls(args, slots):
     checked("docker", "pull", "--quiet", args.image)
     # Removing the real cargo binary in an ephemeral writable container must
     # fail at preflight, before a payload can falsely pass via a host fallback.
@@ -91,7 +92,9 @@ printf 'sibling cache preserved\n'
                 log = root / f"{number}.log"
                 logs.append(log)
                 with log.open("w") as stream:
-                    children.append(subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT))
+                    fd = slots[number].fileno()
+                    children.append(subprocess.Popen(command + ["--slot-fd", str(fd)], pass_fds=(fd,),
+                                                     stdout=stream, stderr=subprocess.STDOUT))
                 def identity():
                     assert children[-1].poll() is None, log.read_text()
                     for line in log.read_text().splitlines():
@@ -128,6 +131,25 @@ printf 'sibling cache preserved\n'
             for log in logs:
                 print(log.read_text())
     return 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--image", required=True)
+    p.add_argument("--wait-seconds", type=float, default=ci.SLOT_WAIT_SECONDS)
+    args = p.parse_args()
+    assert ci.IMAGE.fullmatch(args.image)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, ci.interrupted)
+    try:
+        with contextlib.ExitStack() as cleanup:
+            slots = ci.acquire_slots(ci.state_root(), 2, wait_seconds=args.wait_seconds)
+            for guard in slots:
+                cleanup.callback(guard.close)
+            return controls(args, slots)
+    except ci.Refused as exc:
+        print(f"rust_ci_control=refused reason={exc}", flush=True)
+        return 75
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ jobs:
         env:
           IMAGE: ${{ inputs.image }}
         run: |
-          python3 shared/tests/live_rust_ci.py --image "$IMAGE"
+          python3 shared/tests/slot_contention.py --image "$IMAGE"
       - name: Run committed Rust payload with poisoned host task tools
         env:
           IMAGE: ${{ inputs.image }}

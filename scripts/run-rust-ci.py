@@ -25,6 +25,7 @@ MEMORY = 4 * GIB
 INODES = 200000
 IMAGE = re.compile(r"10\.0\.32\.86:5555/pocketforge/ci-rust@sha256:[a-f0-9]{64}")
 SHA = re.compile(r"[a-f0-9]{40}")
+SLOT_WAIT_SECONDS = 600
 
 
 class Refused(Exception):
@@ -66,6 +67,69 @@ def admission():
         yield
 
 
+def state_root():
+    return Path(f"/tmp/pf-rust-ci-{os.getuid()}")
+
+
+def acquire_slots(root, count=1, *, wait_seconds=SLOT_WAIT_SECONDS):
+    """Atomically claim a single run or the two-control cohort. No hold-and-wait.
+
+    Failed attempts release EVERY partial slot and the admission lock before
+    waiting, so existing siblings finish and ordinary jobs can use spare slots.
+    """
+    if count not in (1, 2) or not 0 <= wait_seconds <= SLOT_WAIT_SECONDS:
+        raise Refused("invalid_slot_request")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait_seconds
+    announced = False
+    while True:
+        acquired = []
+        complete = False
+        try:
+            with admission():
+                for number in range(2):
+                    guard = (root / f"slot-{number}.lock").open("a")
+                    try:
+                        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired.append(guard)
+                    except BlockingIOError:
+                        guard.close()
+                    if len(acquired) == count:
+                        complete = True
+                        return acquired
+        finally:
+            if not complete:
+                for guard in acquired:
+                    guard.close()
+        if time.monotonic() >= deadline:
+            raise Refused("capacity_slots_timeout")
+        if not announced:
+            print(json.dumps({"rust_ci": "waiting_for_slots", "count": count,
+                              "timeout_seconds": wait_seconds}), flush=True)
+            announced = True
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
+
+def adopt_slot(root, fd):
+    """A cohort child inherits one real lifetime lock, never a bypass flag."""
+    identity = os.fstat(fd)
+    allowed = []
+    for number in range(2):
+        path = root / f"slot-{number}.lock"
+        if path.exists():
+            st = path.stat()
+            allowed.append((st.st_dev, st.st_ino))
+    if (identity.st_dev, identity.st_ino) not in allowed:
+        raise Refused("invalid_inherited_slot")
+    guard = os.fdopen(os.dup(fd), "a")
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        guard.close()
+        raise
+    return guard
+
+
 def verify_source(path, sha):
     if not SHA.fullmatch(sha) or output("git", "-C", str(path), "rev-parse", "HEAD") != sha:
         raise Refused("source_identity")
@@ -78,7 +142,7 @@ def archive(path, sha, destination):
         subprocess.run(["git", "-C", str(path), "archive", sha], stdout=stream, check=True)
 
 
-def run(source, source_sha, platform, platform_sha, image, script, *, root=None):
+def run(source, source_sha, platform, platform_sha, image, script, *, root=None, slot_fd=None):
     if not IMAGE.fullmatch(image):
         raise Refused("unpinned_image")
     if not re.fullmatch(r"[A-Za-z0-9_./-]+\.sh", script) or ".." in script or script.startswith("/"):
@@ -86,7 +150,7 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None)
     verify_source(source, source_sha)
     verify_source(platform, platform_sha)
     # Archive only committed files: no checkout tokens, .git, host homes or tools.
-    root = Path(root or f"/tmp/pf-rust-ci-{os.getuid()}")
+    root = Path(root or state_root())
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     directory = None
     name = None
@@ -94,17 +158,8 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None)
     slot = None
     child = None
     try:
+        slot = adopt_slot(root, slot_fd) if slot_fd is not None else acquire_slots(root)[0]
         with admission():
-            for number in range(2):
-                guard = (root / f"slot-{number}.lock").open("a")
-                try:
-                    fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    slot = guard
-                    break
-                except BlockingIOError:
-                    guard.close()
-            if slot is None:
-                raise Refused("capacity_slots")
             active = len(list(root.glob("run-*/reservation.json")))
             docker_root = output("docker", "info", "--format", "{{.DockerRootDir}}")
             memory = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
@@ -194,11 +249,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("source", "source-sha", "platform", "platform-sha", "image", "script"):
         p.add_argument("--" + name, required=True)
+    p.add_argument("--slot-fd", type=int, help="internal: inherited lifetime slot from an admitted control cohort")
     a = p.parse_args()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, interrupted)
     try:
-        return run(Path(a.source), a.source_sha, Path(a.platform), a.platform_sha, a.image, a.script)
+        return run(Path(a.source), a.source_sha, Path(a.platform), a.platform_sha, a.image, a.script,
+                   slot_fd=a.slot_fd)
     except Refused as exc:
         print(json.dumps({"rust_ci": "refused", "reason": str(exc)}), flush=True)
         return 75
