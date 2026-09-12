@@ -64,13 +64,14 @@ test ! -e /var/run/docker.sock
 test ! -e /root/.cargo
 if touch /input/forbidden 2>/dev/null; then exit 42; fi
 printf 'pub fn answer() -> u32 { 42 }\n' > /work/cache-probe.rs
-sccache rustc --crate-name same_key --crate-type lib /work/cache-probe.rs -o /work/libprobe.rlib
-rm /work/libprobe.rlib
-sccache rustc --crate-name same_key --crate-type lib /work/cache-probe.rs -o /work/libprobe.rlib
-sccache --show-stats
+sccache rustc --crate-name same_key --crate-type rlib --emit=link /work/cache-probe.rs --out-dir /work
+rm /work/libsame_key.rlib
+sccache rustc --crate-name same_key --crate-type rlib --emit=link /work/cache-probe.rs --out-dir /work
+sccache --show-stats | tee /work/cache-stats
+grep -Eq '^Cache hits[[:space:]]+[1-9][0-9]*$' /work/cache-stats
 printf ready > /work/ready
 while test ! -e /work/release; do sleep 0.2; done
-test -s /work/libprobe.rlib
+test -s /work/libsame_key.rlib
 test -n "$(find "$SCCACHE_DIR" -type f -print -quit)"
 printf 'sibling cache preserved\n'
 ''')
