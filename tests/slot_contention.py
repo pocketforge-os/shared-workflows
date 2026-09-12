@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
 """Exercise cohort admission with a live ordinary sibling, not an idle pool."""
 import argparse
+import contextlib
+import fcntl
 import json
 import signal
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 import live_rust_ci as live
 
 CONTROLLER = live.CONTROLLER
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--image", required=True)
-    args = p.parse_args()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, live.ci.interrupted)
+@contextlib.contextmanager
+def fixture_admission(root, wait_seconds=live.ci.SLOT_WAIT_SECONDS):
+    # Serialize only synthetic fixture owners. Two test harnesses must not each
+    # hold a deliberately parked sibling while waiting for the other's spare
+    # slot. Ordinary jobs never acquire this test-only lock and remain parallel.
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (root / "contention-fixture.lock").open("a") as guard:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise live.ci.Refused("control_fixture_timeout") from None
+                time.sleep(0.2)
+        yield
+
+
+def exercise(args):
     with tempfile.TemporaryDirectory(prefix="pf-rust-slot-contention-") as tmp:
         root = Path(tmp)
         source = root / "source"
@@ -82,6 +99,20 @@ echo normal_sibling=pass
                 if log.exists():
                     print(log.read_text())
     return 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--image", required=True)
+    args = p.parse_args()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, live.ci.interrupted)
+    try:
+        with fixture_admission(live.ci.state_root()):
+            return exercise(args)
+    except live.ci.Refused as exc:
+        print(f"rust_ci_control=refused reason={exc}", flush=True)
+        return 75
 
 
 if __name__ == "__main__":

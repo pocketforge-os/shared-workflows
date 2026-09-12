@@ -63,6 +63,18 @@ class CapacityTests(unittest.TestCase):
 
 
 class SlotTests(unittest.TestCase):
+    def test_synthetic_fixture_owners_serialize_without_locking_ordinary_slots(self):
+        import slot_contention
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as cleanup:
+            root = Path(tmp)
+            cleanup.enter_context(slot_contention.fixture_admission(root, wait_seconds=0))
+            with self.assertRaisesRegex(slot_contention.live.ci.Refused, "control_fixture_timeout"):
+                with slot_contention.fixture_admission(root, wait_seconds=0):
+                    self.fail("another parked-fixture owner was admitted")
+            ordinary = ci.acquire_slots(root, 2, wait_seconds=0)
+            for guard in ordinary:
+                cleanup.callback(guard.close)
+
     def test_busy_cohort_times_out_without_holding_spare_or_touching_sibling(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as cleanup:
             root = Path(tmp)

@@ -69,6 +69,9 @@ boundedly when the control cohort temporarily owns both slots. Expiry reports
 sibling state. Profile CI's `tests/slot_contention.py` holds a real normal sibling,
 observes the waiting cohort, runs another normal job in the spare slot, then
 releases the sibling and proves the cache/cancellation controls complete.
+Synthetic contention-fixture owners additionally serialize on a test-only lock
+so concurrent profile validations cannot each park a sibling indefinitely.
+Ordinary callers do not acquire that fixture lock.
 
 GitHub prefixes reusable checks with caller/callee names. Runtime retains its
 original check name as a fail-closed dependent result gate; the full test payload
