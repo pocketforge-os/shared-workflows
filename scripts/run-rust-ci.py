@@ -3,7 +3,8 @@
 
 Two concurrent slots, conservative per-run reservations and private bounded
 sccache. No persistent target/registry cache or cache export. Failed engine
-cleanup retains the reservation; only this invocation's resources are removed.
+cleanup retains the reservation until a later admission proves its owner gone;
+only the exact container recorded by that reservation is removed.
 """
 import argparse
 import contextlib

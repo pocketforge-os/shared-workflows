@@ -2,8 +2,11 @@
 """Fault controls at the actual admission/identity boundary; no task packages."""
 import importlib.util
 import contextlib
-import queue
 import json
+import multiprocessing
+import os
+import queue
+import signal
 import tempfile
 import threading
 from pathlib import Path
@@ -14,6 +17,13 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("rust_ci", Path(__file__).parents[1] / "scripts/run-rust-ci.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+
+
+def hold_lock(path, ready):
+    with Path(path).open("a") as guard:
+        ci.fcntl.flock(guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+        ready.set()
+        signal.pause()
 
 
 class CapacityTests(unittest.TestCase):
@@ -29,6 +39,13 @@ class CapacityTests(unittest.TestCase):
             root = Path(tmp)
             dead, dead_guard = self.reservation(root, "run-dead")
             dead_guard.close()
+            ready = multiprocessing.Event()
+            owner = multiprocessing.Process(target=hold_lock, args=(dead / "run.lock", ready))
+            owner.start()
+            self.assertTrue(ready.wait(2))
+            os.kill(owner.pid, signal.SIGKILL)
+            owner.join(2)
+            self.assertEqual(owner.exitcode, -signal.SIGKILL)
             live, live_guard = self.reservation(root, "run-live")
             ci.fcntl.flock(live_guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
             try:
