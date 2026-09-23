@@ -72,6 +72,56 @@ def state_root():
     return Path(f"/tmp/pf-rust-ci-{os.getuid()}")
 
 
+def active_reservations(root):
+    """Count live reservations and reclaim only provably dead owners."""
+    active = 0
+    for reservation_path in root.glob("run-*/reservation.json"):
+        directory = reservation_path.parent
+        lock_path = directory / "run.lock"
+        if not lock_path.exists():
+            print(json.dumps({"rust_ci": "reservation_alive", "reason": "missing_run_lock",
+                              "directory": str(directory)}), flush=True)
+            active += 1
+            continue
+        guard = lock_path.open("a")
+        try:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                active += 1
+                continue
+            try:
+                reservation = json.loads(reservation_path.read_text())
+                name = reservation["name"]
+                if not isinstance(name, str) or not name:
+                    raise ValueError("invalid container name")
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                print(json.dumps({"rust_ci": "reservation_alive",
+                                  "reason": "reservation_identity_unknown",
+                                  "directory": str(directory)}), flush=True)
+                active += 1
+                continue
+            result = subprocess.run(["docker", "rm", "-f", name], timeout=20,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                shutil.rmtree(directory)
+                print(json.dumps({"rust_ci": "reclaimed", "reason": "owner_gone",
+                                  "name": name, "directory": str(directory)}), flush=True)
+            else:
+                print(json.dumps({"rust_ci": "reservation_alive",
+                                  "reason": "engine_cleanup_unconfirmed",
+                                  "name": name, "directory": str(directory)}), flush=True)
+                active += 1
+        except (OSError, subprocess.TimeoutExpired):
+            print(json.dumps({"rust_ci": "reservation_alive",
+                              "reason": "reclaim_unconfirmed",
+                              "directory": str(directory)}), flush=True)
+            active += 1
+        finally:
+            guard.close()
+    return active
+
+
 def acquire_slots(root, count=1, *, wait_seconds=SLOT_WAIT_SECONDS):
     """Atomically claim a single run or the two-control cohort. No hold-and-wait.
 
@@ -186,16 +236,19 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
     name = None
     cleaned = True
     slot = None
+    run_guard = None
     child = None
     try:
         slot = adopt_slot(root, slot_fd) if slot_fd is not None else acquire_slots(root)[0]
         with admission():
-            active = len(list(root.glob("run-*/reservation.json")))
+            active = active_reservations(root)
             docker_root = output("docker", "info", "--format", "{{.DockerRootDir}}")
             memory = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
                           if line.startswith("MemAvailable:"))
             capacity([root, docker_root], active, memory)
             directory = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+            run_guard = (directory / "run.lock").open("a")
+            fcntl.flock(run_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
             name = f"pf-rust-{os.getuid()}-{directory.name}"
             reservation = dict(name=name, disk=DISK, memory=MEMORY, inodes=INODES,
                                image=image, source_sha=source_sha, platform_sha=platform_sha,
@@ -267,6 +320,8 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
         finally:
             if slot:
                 slot.close()
+            if run_guard:
+                run_guard.close()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 

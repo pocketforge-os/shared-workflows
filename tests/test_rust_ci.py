@@ -3,6 +3,7 @@
 import importlib.util
 import contextlib
 import queue
+import json
 import tempfile
 import threading
 from pathlib import Path
@@ -16,6 +17,54 @@ spec.loader.exec_module(ci)
 
 
 class CapacityTests(unittest.TestCase):
+    def reservation(self, root, name, *, lock=True):
+        directory = root / name
+        directory.mkdir()
+        (directory / "reservation.json").write_text(json.dumps({"name": f"container-{name}"}))
+        guard = (directory / "run.lock").open("a") if lock else None
+        return directory, guard
+
+    def test_dead_owner_reclaimed_by_its_recorded_name_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, dead_guard = self.reservation(root, "run-dead")
+            dead_guard.close()
+            live, live_guard = self.reservation(root, "run-live")
+            ci.fcntl.flock(live_guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+            try:
+                with patch.object(ci.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as engine:
+                    self.assertEqual(ci.active_reservations(root), 1)
+                engine.assert_called_once_with(["docker", "rm", "-f", "container-run-dead"], timeout=20,
+                                               stdout=ci.subprocess.DEVNULL, stderr=ci.subprocess.DEVNULL)
+                self.assertFalse(dead.exists())
+                self.assertTrue(live.exists())
+            finally:
+                live_guard.close()
+
+    def test_live_owner_and_same_label_sibling_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live, guard = self.reservation(root, "run-live")
+            ci.fcntl.flock(guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+            try:
+                with patch.object(ci.subprocess, "run") as engine:
+                    self.assertEqual(ci.active_reservations(root), 1)
+                engine.assert_not_called()
+                self.assertTrue(live.exists())
+            finally:
+                guard.close()
+
+    def test_missing_run_lock_is_alive_and_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, _ = self.reservation(root, "run-legacy", lock=False)
+            with patch("builtins.print") as log, patch.object(ci.subprocess, "run") as engine:
+                self.assertEqual(ci.active_reservations(root), 1)
+            engine.assert_not_called()
+            self.assertTrue(legacy.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "missing_run_lock")
+
     def test_live_disk_scan_tolerates_unlinked_rustc_intermediate_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

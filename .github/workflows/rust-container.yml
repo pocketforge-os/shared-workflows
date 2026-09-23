@@ -1,6 +1,10 @@
 name: Pinned Rust container
 on:
   workflow_call:
+    outputs:
+      refusal-reason:
+        description: Admission refusal reason, empty when the payload was admitted
+        value: ${{ jobs.container.outputs.refusal-reason }}
     inputs:
       source-sha:
         description: Exact caller candidate or synthetic merge SHA (normally github.sha)
@@ -31,6 +35,8 @@ permissions:
 jobs:
   container:
     name: Rust container
+    outputs:
+      refusal-reason: ${{ steps.rust-ci.outputs.refusal-reason }}
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -83,6 +89,7 @@ jobs:
         run: |
           python3 shared/tests/slot_contention.py --image "$IMAGE"
       - name: Run committed Rust payload with poisoned host task tools
+        id: rust-ci
         env:
           IMAGE: ${{ inputs.image }}
           SOURCE_SHA: ${{ inputs.source-sha }}
@@ -96,6 +103,29 @@ jobs:
           done
           platform_sha="$(git -C platform rev-parse HEAD)"
           printf 'tested_source=%s platform=%s image=%s runner=%s\n' "$SOURCE_SHA" "$platform_sha" "$IMAGE" "$RUNNER_NAME" | tee -a "$GITHUB_STEP_SUMMARY"
+          set +e
           PATH="$poison:$PATH" RUSTC_WRAPPER="$poison/sccache" \
             python3 shared/scripts/run-rust-ci.py --source source --source-sha "$SOURCE_SHA" \
-              --platform platform --platform-sha "$platform_sha" --image "$IMAGE" --script "$SCRIPT"
+              --platform platform --platform-sha "$platform_sha" --image "$IMAGE" --script "$SCRIPT" \
+              2>&1 | tee "$RUNNER_TEMP/rust-ci-result.log"
+          result=${PIPESTATUS[0]}
+          reason="$(python3 - "$RUNNER_TEMP/rust-ci-result.log" <<'PY'
+          import json
+          import sys
+
+          reason = ""
+          for line in open(sys.argv[1], encoding="utf-8"):
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get("rust_ci") == "refused":
+                  reason = event.get("reason", "unknown")
+          print(reason)
+          PY
+          )"
+          printf 'refusal-reason=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+          if [[ -n "$reason" ]]; then
+            echo "refused: $reason"
+          fi
+          exit "$result"
