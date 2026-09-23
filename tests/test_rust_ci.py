@@ -58,6 +58,59 @@ class CapacityTests(unittest.TestCase):
             finally:
                 live_guard.close()
 
+    def test_dead_owner_without_container_is_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-never-created")
+            guard.close()
+            absent = SimpleNamespace(returncode=1,
+                                     stderr="Error: No such container: container-run-never-created\n")
+            with patch.object(ci.subprocess, "run",
+                              side_effect=[SimpleNamespace(returncode=1), absent]) as engine:
+                self.assertEqual(ci.active_reservations(root), 0)
+            self.assertEqual(engine.call_count, 2)
+            self.assertFalse(dead.exists())
+
+    def test_failed_create_without_allocation_is_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-create-failed")
+            guard.close()
+            absent = SimpleNamespace(returncode=1,
+                                     stderr="Error: No such container: container-run-create-failed\n")
+            with patch.object(ci.subprocess, "run",
+                              side_effect=[SimpleNamespace(returncode=125), absent]):
+                self.assertEqual(ci.active_reservations(root), 0)
+            self.assertFalse(dead.exists())
+
+    def test_engine_failure_retains_dead_reservation_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-engine-failed")
+            guard.close()
+            unavailable = SimpleNamespace(returncode=1,
+                                          stderr="Cannot connect to the Docker daemon\n")
+            with patch.object(ci.subprocess, "run",
+                              side_effect=[SimpleNamespace(returncode=1), unavailable]), \
+                    patch("builtins.print") as log:
+                self.assertEqual(ci.active_reservations(root), 1)
+            self.assertTrue(dead.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "engine_cleanup_unconfirmed")
+
+    def test_engine_timeout_retains_dead_reservation_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-engine-timeout")
+            guard.close()
+            with patch.object(ci.subprocess, "run",
+                              side_effect=ci.subprocess.TimeoutExpired("docker", 20)), \
+                    patch("builtins.print") as log:
+                self.assertEqual(ci.active_reservations(root), 1)
+            self.assertTrue(dead.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "reclaim_unconfirmed")
+
     def test_live_owner_and_same_label_sibling_are_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

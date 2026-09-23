@@ -73,6 +73,18 @@ def state_root():
     return Path(f"/tmp/pf-rust-ci-{os.getuid()}")
 
 
+def remove_reserved_container(name):
+    """Remove one exact container, or positively establish that it is absent."""
+    result = subprocess.run(["docker", "rm", "-f", name], timeout=20,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode == 0:
+        return True
+    inspected = subprocess.run(["docker", "container", "inspect", name], timeout=20,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    missing = f"Error: No such container: {name}"
+    return inspected.returncode == 1 and missing in inspected.stderr.splitlines()
+
+
 def active_reservations(root):
     """Count live reservations and reclaim only provably dead owners."""
     active = 0
@@ -102,9 +114,7 @@ def active_reservations(root):
                                   "directory": str(directory)}), flush=True)
                 active += 1
                 continue
-            result = subprocess.run(["docker", "rm", "-f", name], timeout=20,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode == 0:
+            if remove_reserved_container(name):
                 shutil.rmtree(directory)
                 print(json.dumps({"rust_ci": "reclaimed", "reason": "owner_gone",
                                   "name": name, "directory": str(directory)}), flush=True)
