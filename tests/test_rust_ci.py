@@ -2,7 +2,11 @@
 """Fault controls at the actual admission/identity boundary; no task packages."""
 import importlib.util
 import contextlib
+import json
+import multiprocessing
+import os
 import queue
+import signal
 import tempfile
 import threading
 from pathlib import Path
@@ -15,7 +19,122 @@ ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 
 
+def hold_lock(path, ready):
+    with Path(path).open("a") as guard:
+        ci.fcntl.flock(guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+        ready.set()
+        signal.pause()
+
+
 class CapacityTests(unittest.TestCase):
+    def reservation(self, root, name, *, lock=True):
+        directory = root / name
+        directory.mkdir()
+        (directory / "reservation.json").write_text(json.dumps({"name": f"container-{name}"}))
+        guard = (directory / "run.lock").open("a") if lock else None
+        return directory, guard
+
+    def test_dead_owner_reclaimed_by_its_recorded_name_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, dead_guard = self.reservation(root, "run-dead")
+            dead_guard.close()
+            ready = multiprocessing.Event()
+            owner = multiprocessing.Process(target=hold_lock, args=(dead / "run.lock", ready))
+            owner.start()
+            self.assertTrue(ready.wait(2))
+            os.kill(owner.pid, signal.SIGKILL)
+            owner.join(2)
+            self.assertEqual(owner.exitcode, -signal.SIGKILL)
+            live, live_guard = self.reservation(root, "run-live")
+            ci.fcntl.flock(live_guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+            try:
+                with patch.object(ci.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as engine:
+                    self.assertEqual(ci.active_reservations(root), 1)
+                engine.assert_called_once_with(["docker", "rm", "-f", "container-run-dead"], timeout=20,
+                                               stdout=ci.subprocess.DEVNULL, stderr=ci.subprocess.DEVNULL)
+                self.assertFalse(dead.exists())
+                self.assertTrue(live.exists())
+            finally:
+                live_guard.close()
+
+    def test_dead_owner_without_container_is_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-never-created")
+            guard.close()
+            absent = SimpleNamespace(returncode=1,
+                                     stderr="Error: No such container: container-run-never-created\n")
+            with patch.object(ci.subprocess, "run",
+                              side_effect=[SimpleNamespace(returncode=1), absent]) as engine:
+                self.assertEqual(ci.active_reservations(root), 0)
+            self.assertEqual(engine.call_count, 2)
+            self.assertFalse(dead.exists())
+
+    def test_failed_create_without_allocation_is_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-create-failed")
+            guard.close()
+            absent = SimpleNamespace(returncode=1,
+                                     stderr="Error: No such container: container-run-create-failed\n")
+            with patch.object(ci.subprocess, "run",
+                              side_effect=[SimpleNamespace(returncode=125), absent]):
+                self.assertEqual(ci.active_reservations(root), 0)
+            self.assertFalse(dead.exists())
+
+    def test_engine_failure_retains_dead_reservation_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-engine-failed")
+            guard.close()
+            unavailable = SimpleNamespace(returncode=1,
+                                          stderr="Cannot connect to the Docker daemon\n")
+            with patch.object(ci.subprocess, "run",
+                              side_effect=[SimpleNamespace(returncode=1), unavailable]), \
+                    patch("builtins.print") as log:
+                self.assertEqual(ci.active_reservations(root), 1)
+            self.assertTrue(dead.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "engine_cleanup_unconfirmed")
+
+    def test_engine_timeout_retains_dead_reservation_and_logs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dead, guard = self.reservation(root, "run-engine-timeout")
+            guard.close()
+            with patch.object(ci.subprocess, "run",
+                              side_effect=ci.subprocess.TimeoutExpired("docker", 20)), \
+                    patch("builtins.print") as log:
+                self.assertEqual(ci.active_reservations(root), 1)
+            self.assertTrue(dead.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "reclaim_unconfirmed")
+
+    def test_live_owner_and_same_label_sibling_are_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live, guard = self.reservation(root, "run-live")
+            ci.fcntl.flock(guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+            try:
+                with patch.object(ci.subprocess, "run") as engine:
+                    self.assertEqual(ci.active_reservations(root), 1)
+                engine.assert_not_called()
+                self.assertTrue(live.exists())
+            finally:
+                guard.close()
+
+    def test_missing_run_lock_is_alive_and_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, _ = self.reservation(root, "run-legacy", lock=False)
+            with patch("builtins.print") as log, patch.object(ci.subprocess, "run") as engine:
+                self.assertEqual(ci.active_reservations(root), 1)
+            engine.assert_not_called()
+            self.assertTrue(legacy.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "missing_run_lock")
+
     def test_live_disk_scan_tolerates_unlinked_rustc_intermediate_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
