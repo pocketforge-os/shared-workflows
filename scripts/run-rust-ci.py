@@ -25,13 +25,21 @@ GIB = 1024**3
 DISK = 8 * GIB
 MEMORY = 4 * GIB
 INODES = 200000
-IMAGE = re.compile(r"10\.0\.32\.86:5555/pocketforge/ci-rust@sha256:[a-f0-9]{64}")
+CI_RUST_IMAGE = "10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9"
+CI_TOOLS_IMAGE = "10.0.32.86:5555/pocketforge/ci-tools@sha256:2ff536627228c90e5c32b7d6345b21600a38a17481c075b41683db47ead3e862"
+ALLOWED_IMAGES = frozenset((CI_RUST_IMAGE, CI_TOOLS_IMAGE))
 SHA = re.compile(r"[a-f0-9]{40}")
 SLOT_WAIT_SECONDS = 600
 
 
 class Refused(Exception):
     pass
+
+
+def verify_image(image):
+    """Admit only reviewed repository+digest pairs, never arbitrary digests."""
+    if image not in ALLOWED_IMAGES:
+        raise Refused("unpinned_image")
 
 
 def output(*args):
@@ -234,8 +242,7 @@ def disk_usage(root):
 
 
 def run(source, source_sha, platform, platform_sha, image, script, *, root=None, slot_fd=None):
-    if not IMAGE.fullmatch(image):
-        raise Refused("unpinned_image")
+    verify_image(image)
     if not re.fullmatch(r"[A-Za-z0-9_./-]+\.sh", script) or ".." in script or script.startswith("/"):
         raise Refused("invalid_script")
     verify_source(source, source_sha)

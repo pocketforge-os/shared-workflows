@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       image:
-        description: Published ci-rust image including sha256 digest
+        description: Reviewed CI profile including its exact sha256 digest
         required: true
         type: string
       script:
@@ -52,7 +52,11 @@ jobs:
         run: |
           [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$SOURCE_SHA" == "$EXPECTED_SHA" ]]
           [[ "$WORKFLOW_SHA" =~ ^[a-f0-9]{40}$ ]]
-          [[ "$IMAGE" =~ ^10\.0\.32\.86:5555/pocketforge/ci-rust@sha256:[a-f0-9]{64}$ ]]
+          case "$IMAGE" in
+            10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9|\
+            10.0.32.86:5555/pocketforge/ci-tools@sha256:2ff536627228c90e5c32b7d6345b21600a38a17481c075b41683db47ead3e862) ;;
+            *) echo "refused: image_not_allowlisted" >&2; exit 1 ;;
+          esac
       - name: Checkout exact caller source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -88,7 +92,7 @@ jobs:
           IMAGE: ${{ inputs.image }}
         run: |
           python3 shared/tests/slot_contention.py --image "$IMAGE"
-      - name: Run committed Rust payload with poisoned host task tools
+      - name: Run committed payload with poisoned host task tools
         id: rust-ci
         env:
           IMAGE: ${{ inputs.image }}
@@ -96,7 +100,11 @@ jobs:
           SCRIPT: ${{ inputs.script }}
         run: |
           poison="$(mktemp -d "$RUNNER_TEMP/rust-host-poison.XXXXXX")"
-          trap 'rm -rf "$poison"' EXIT
+          cleanup_poison() {
+            find "$poison" -mindepth 1 -delete
+            rmdir "$poison"
+          }
+          trap cleanup_poison EXIT
           for tool in rustc cargo rustup rustfmt clippy-driver sccache gcc cc aarch64-linux-gnu-gcc aarch64-none-linux-gnu-gcc; do
             printf '#!/bin/sh\necho "forbidden host task tool: %s" >&2\nexit 97\n' "$tool" > "$poison/$tool"
             chmod +x "$poison/$tool"
