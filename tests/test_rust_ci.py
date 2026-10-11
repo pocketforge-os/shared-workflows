@@ -354,6 +354,49 @@ class CapacityWaitTests(unittest.TestCase):
             self.assertEqual(calls, [0])
 
 
+class RunAdmissionTests(unittest.TestCase):
+    def test_admitted_run_reaches_execution_and_cleans_up_with_fakes_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            state.mkdir()
+            sha = "a" * 40
+            image = "10.0.32.86:5555/pocketforge/ci-rust@sha256:" + "b" * 64
+            calls = []
+
+            def fake_output(*args):
+                calls.append(args)
+                if "rev-parse" in args:
+                    return sha
+                if "status" in args:
+                    return ""
+                if "info" in args:
+                    return "/docker"
+                if "show" in args:
+                    return "0"
+                raise AssertionError(args)
+
+            def fake_run(command, **kwargs):
+                calls.append(tuple(command))
+                return SimpleNamespace(returncode=0)
+
+            child = SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0)
+            with patch.object(ci, "output", side_effect=fake_output), \
+                    patch.object(ci.subprocess, "run", side_effect=fake_run), \
+                    patch.object(ci.subprocess, "Popen", return_value=child), \
+                    patch.object(ci.os, "statvfs", return_value=SimpleNamespace(
+                        f_bavail=100 * ci.GIB // 4096, f_frsize=4096, f_favail=1000000)), \
+                    patch.object(ci, "host_memory", return_value=32 * ci.GIB), \
+                    patch("builtins.print") as log:
+                rc = ci.run(root / "source", sha, root / "platform", sha, image, "ci.sh", root=state)
+            self.assertEqual(rc, 0)
+            kinds = [json.loads(c.args[0])["rust_ci"] for c in log.call_args_list
+                     if c.args and isinstance(c.args[0], str) and c.args[0].startswith("{")]
+            self.assertEqual(kinds, ["starting", "finished"])
+            self.assertEqual(list(state.glob("run-*")), [])
+            self.assertTrue(any(list(command[:3]) == ["docker", "rm", "-f"] for command in calls))
+
+
 class SlotTests(unittest.TestCase):
     def test_synthetic_fixture_owners_serialize_without_locking_ordinary_slots(self):
         import slot_contention

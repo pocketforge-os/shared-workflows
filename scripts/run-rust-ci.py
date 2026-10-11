@@ -4,7 +4,9 @@
 Two concurrent slots, conservative per-run reservations and private bounded
 sccache. No persistent target/registry cache or cache export. Failed engine
 cleanup retains the reservation until a later admission proves its owner gone;
-only the exact container recorded by that reservation is removed.
+only the exact container recorded by that reservation is removed. A capacity
+refusal while sibling reservations are active is contention, not a verdict: it
+waits (bounded, without holding a slot) instead of refusing.
 """
 import argparse
 import contextlib
@@ -28,6 +30,8 @@ INODES = 200000
 IMAGE = re.compile(r"10\.0\.32\.86:5555/pocketforge/ci-rust@sha256:[a-f0-9]{64}")
 SHA = re.compile(r"[a-f0-9]{40}")
 SLOT_WAIT_SECONDS = 600
+CAPACITY_RECHECK_SECONDS = 2
+CAPACITY_REASONS = ("disk_capacity", "inode_capacity", "memory_capacity")
 
 
 class Refused(Exception):
@@ -192,6 +196,60 @@ def adopt_slot(root, fd):
     return guard
 
 
+def host_memory():
+    """MemAvailable already excludes resident sibling usage; never add it back."""
+    return next(int(line.split()[1]) * 1024
+                for line in Path("/proc/meminfo").read_text().splitlines()
+                if line.startswith("MemAvailable:"))
+
+
+def admit(root, reserve, *, slot=None, wait_seconds=SLOT_WAIT_SECONDS):
+    """Run reserve(active) under the admission lock, waiting out live siblings.
+
+    A memory, disk or inode refusal while other reservations are active is
+    contention, not a verdict: release the pool slot and the admission lock
+    before waiting (no hold-and-wait), announce waiting_for_capacity once,
+    sleep briefly and re-check within the wait_seconds deadline. Refuse with
+    the original reason when nothing else is active or the deadline passes.
+    An inherited cohort slot belongs to the parent and cannot be released,
+    so such a run never waits. Returns (slot, reserve's result).
+    """
+    if not 0 <= wait_seconds <= SLOT_WAIT_SECONDS:
+        raise Refused("invalid_capacity_wait")
+    inherited = slot is not None
+    deadline = time.monotonic() + wait_seconds
+    announced = False
+    while True:
+        refusal = None
+        admitted = False
+        result = None
+        if not inherited:
+            slot = acquire_slots(root, wait_seconds=max(0, deadline - time.monotonic()))[0]
+        try:
+            with admission():
+                active = active_reservations(root)
+                try:
+                    result = reserve(active)
+                except Refused as exc:
+                    refusal = exc
+                    if (inherited or str(exc) not in CAPACITY_REASONS or active == 0
+                            or time.monotonic() >= deadline):
+                        raise
+                else:
+                    admitted = True
+        finally:
+            if not admitted and not inherited and slot is not None:
+                slot.close()
+                slot = None
+        if admitted:
+            return slot, result
+        if not announced:
+            print(json.dumps({"rust_ci": "waiting_for_capacity", "reason": str(refusal),
+                              "timeout_seconds": wait_seconds}), flush=True)
+            announced = True
+        time.sleep(min(CAPACITY_RECHECK_SECONDS, max(0, deadline - time.monotonic())))
+
+
 def verify_source(path, sha):
     if not SHA.fullmatch(sha) or output("git", "-C", str(path), "rev-parse", "HEAD") != sha:
         raise Refused("source_identity")
@@ -249,26 +307,30 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
     slot = None
     run_guard = None
     child = None
+
+    def reserve(active):
+        """Capacity verdict and durable reservation, atomic under the admission lock."""
+        nonlocal directory, run_guard, name
+        docker_root = output("docker", "info", "--format", "{{.DockerRootDir}}")
+        capacity([root, docker_root], active, host_memory())
+        directory = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+        run_guard = (directory / "run.lock").open("a")
+        fcntl.flock(run_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        name = f"pf-rust-{os.getuid()}-{directory.name}"
+        reservation = dict(name=name, disk=DISK, memory=MEMORY, inodes=INODES,
+                           image=image, source_sha=source_sha, platform_sha=platform_sha,
+                           run_id=os.environ.get("GITHUB_RUN_ID", "local"),
+                           run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "0"))
+        with (directory / "reservation.json").open("w") as stream:
+            json.dump(reservation, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return reservation
+
     try:
-        slot = adopt_slot(root, slot_fd) if slot_fd is not None else acquire_slots(root)[0]
-        with admission():
-            active = active_reservations(root)
-            docker_root = output("docker", "info", "--format", "{{.DockerRootDir}}")
-            memory = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
-                          if line.startswith("MemAvailable:"))
-            capacity([root, docker_root], active, memory)
-            directory = Path(tempfile.mkdtemp(prefix="run-", dir=root))
-            run_guard = (directory / "run.lock").open("a")
-            fcntl.flock(run_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            name = f"pf-rust-{os.getuid()}-{directory.name}"
-            reservation = dict(name=name, disk=DISK, memory=MEMORY, inodes=INODES,
-                               image=image, source_sha=source_sha, platform_sha=platform_sha,
-                               run_id=os.environ.get("GITHUB_RUN_ID", "local"),
-                               run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "0"))
-            with (directory / "reservation.json").open("w") as stream:
-                json.dump(reservation, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
+        if slot_fd is not None:
+            slot = adopt_slot(root, slot_fd)
+        slot, reservation = admit(root, reserve, slot=slot)
         # The slot + durable reservation remain held while pulling/staging/running.
         subprocess.run(["docker", "pull", "--quiet", image], check=True, stdout=subprocess.DEVNULL)
         source_input = directory / "input"
