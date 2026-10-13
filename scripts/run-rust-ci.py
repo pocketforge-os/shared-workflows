@@ -460,7 +460,14 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
             "--mount", f"type=bind,src={work},dst=/work",
             "--env", f"PF_SOURCE_SHA={source_sha}", "--env", f"PF_PLATFORM_SHA={platform_sha}",
             "--env", f"PF_IMAGE={image}", "--env", f"SOURCE_DATE_EPOCH={epoch}",
-            "--env", "PF_PLATFORM_DIR=/work/platform", image, "bash", "-euc",
+            "--env", "PF_PLATFORM_DIR=/work/platform",
+            # Every run starts with an empty private target. Incremental state and
+            # debug sections only consume the guarded producer budget; none of the
+            # pass/fail phases consume them.
+            "--env", "CARGO_INCREMENTAL=0",
+            "--env", "CARGO_PROFILE_DEV_DEBUG=0",
+            "--env", "CARGO_PROFILE_TEST_DEBUG=0",
+            image, "bash", "-euc",
             'mkdir -p /work/source /work/platform; tar -xf /input/source.tar -C /work/source; '
             'tar -xf /input/platform.tar -C /work/platform; cd /work/source; exec bash "$1"',
             "rust-ci", script,

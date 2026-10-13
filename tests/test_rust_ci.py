@@ -444,6 +444,10 @@ class RunAdmissionTests(unittest.TestCase):
             self.assertEqual(kinds, ["starting", "finished", "disk_accounting"])
             self.assertEqual(list(state.glob("run-*")), [])
             self.assertTrue(any(list(command[:3]) == ["docker", "rm", "-f"] for command in calls))
+            create = next(command for command in calls if command[:2] == ("docker", "create"))
+            self.assertIn("CARGO_INCREMENTAL=0", create)
+            self.assertIn("CARGO_PROFILE_DEV_DEBUG=0", create)
+            self.assertIn("CARGO_PROFILE_TEST_DEBUG=0", create)
 
     def test_accounting_emitted_for_pass_and_over_budget_refusal(self):
         """One hermetic invocation proves both the positive and negative controls."""
