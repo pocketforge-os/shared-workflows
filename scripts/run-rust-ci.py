@@ -86,6 +86,70 @@ def state_root():
     return Path(f"/tmp/pf-rust-ci-{os.getuid()}")
 
 
+def fsync_directory(path):
+    """Persist directory-entry ordering used by the reservation protocol."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_reservation(root, reservation):
+    """Lock a hidden staging directory, then publish one complete run atomically."""
+    staging = Path(tempfile.mkdtemp(prefix=".run-", dir=root))
+    published = root / staging.name.removeprefix(".")
+    guard = None
+    try:
+        guard = (staging / "run.lock").open("a")
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        reservation = dict(reservation,
+                           name=f"pf-rust-{os.getuid()}-{published.name}")
+        temporary = staging / ".reservation.json.tmp"
+        with temporary.open("w") as stream:
+            json.dump(reservation, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, staging / "reservation.json")
+        fsync_directory(staging)
+        staging.rename(published)
+        fsync_directory(root)
+        return published, guard, reservation
+    except BaseException:
+        if guard is not None:
+            guard.close()
+        candidate = published if published.exists() else staging
+        if candidate.exists():
+            shutil.rmtree(candidate)
+        raise
+
+
+def cleanup_reservation(directory, guard):
+    """Unpublish identity durably before releasing and removing its lock."""
+    (directory / "reservation.json").unlink(missing_ok=True)
+    fsync_directory(directory)
+    if guard is not None:
+        guard.close()
+    (directory / "run.lock").unlink(missing_ok=True)
+    shutil.rmtree(directory)
+    fsync_directory(directory.parent)
+
+
+def refusal_event(exc, root=None):
+    """Give every refusal enough capacity context to diagnose contention."""
+    root = Path(root or state_root())
+    try:
+        active = sum(1 for _ in root.glob("run-*/reservation.json"))
+    except OSError:
+        active = None
+    try:
+        available_memory = host_memory()
+    except (OSError, StopIteration, ValueError):
+        available_memory = None
+    return {"rust_ci": "refused", "reason": str(exc), "active": active,
+            "available_memory": available_memory}
+
+
 def remove_reserved_container(name):
     """Remove one exact container, or positively establish that it is absent."""
     result = subprocess.run(["docker", "rm", "-f", name], timeout=20,
@@ -133,7 +197,10 @@ def active_reservations(root):
                                       "directory": str(directory)}), flush=True)
                     active += 1
                 else:
+                    reservation_path.unlink()
+                    fsync_directory(directory)
                     shutil.rmtree(directory)
+                    fsync_directory(root)
                     print(json.dumps({"rust_ci": "reclaimed",
                                       "reason": "legacy_owner_gone", "name": name,
                                       "directory": str(directory)}), flush=True)
@@ -163,7 +230,8 @@ def active_reservations(root):
                 active += 1
                 continue
             if remove_reserved_container(name):
-                shutil.rmtree(directory)
+                cleanup_reservation(directory, guard)
+                guard = None
                 print(json.dumps({"rust_ci": "reclaimed", "reason": "owner_gone",
                                   "name": name, "directory": str(directory)}), flush=True)
             else:
@@ -177,7 +245,8 @@ def active_reservations(root):
                               "directory": str(directory)}), flush=True)
             active += 1
         finally:
-            guard.close()
+            if guard is not None:
+                guard.close()
     return active
 
 
@@ -412,18 +481,12 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
         nonlocal directory, run_guard, name
         docker_root = output("docker", "info", "--format", "{{.DockerRootDir}}")
         capacity([root, docker_root], active, host_memory())
-        directory = Path(tempfile.mkdtemp(prefix="run-", dir=root))
-        run_guard = (directory / "run.lock").open("a")
-        fcntl.flock(run_guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        name = f"pf-rust-{os.getuid()}-{directory.name}"
-        reservation = dict(name=name, disk=DISK, memory=MEMORY, inodes=INODES,
-                           image=image, source_sha=source_sha, platform_sha=platform_sha,
+        reservation = dict(disk=DISK, memory=MEMORY, inodes=INODES, image=image,
+                           source_sha=source_sha, platform_sha=platform_sha,
                            run_id=os.environ.get("GITHUB_RUN_ID", "local"),
                            run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "0"))
-        with (directory / "reservation.json").open("w") as stream:
-            json.dump(reservation, stream)
-            stream.flush()
-            os.fsync(stream.fileno())
+        directory, run_guard, reservation = publish_reservation(root, reservation)
+        name = reservation["name"]
         return reservation
 
     try:
@@ -518,7 +581,8 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
                 except Refused:
                     pass
             if directory and cleaned:
-                shutil.rmtree(directory)
+                cleanup_reservation(directory, run_guard)
+                run_guard = None
             elif directory:
                 print(json.dumps({"rust_ci": "retained", "reason": "engine_cleanup_unconfirmed",
                                   "directory": str(directory)}), flush=True)
@@ -548,7 +612,7 @@ def main():
         return run(Path(a.source), a.source_sha, Path(a.platform), a.platform_sha, a.image, a.script,
                    slot_fd=a.slot_fd)
     except Refused as exc:
-        print(json.dumps({"rust_ci": "refused", "reason": str(exc)}), flush=True)
+        print(json.dumps(refusal_event(exc)), flush=True)
         return 75
 
 
