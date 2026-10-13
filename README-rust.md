@@ -2,8 +2,8 @@
 
 Call `.github/workflows/rust-container.yml@<full-commit-sha>` at job level, with
 `contents: read`, `source-sha: ${{ github.sha }}`, the **same** commit in
-`workflow-sha`, a `10.0.32.86:5555/pocketforge/ci-rust@sha256:<64-hex>` image and a
-committed `script: scripts/ci-container.sh`. The script runs in `/work/source`.
+`workflow-sha`, an allowlisted repository+digest pair, and a committed
+`script: scripts/ci-container.sh`. The script runs in `/work/source`.
 Do not pass secrets/inherit, host Cargo/Rust paths, privileged options or runner
 names. Same-org public and private callers are supported. The public workflow
 checks out its public helper, not the private automation image-source repository.
@@ -14,6 +14,14 @@ are checked and archived without `.git`/credentials. Pass the recorded exact
 platform SHA to replay. PR source is the synthetic merge (`github.sha`), not a
 moving pull ref or just head. Source/image/platform/runner identities are logged.
 Any `source-sha` different from `github.sha` is refused before checkout.
+
+The allowlist is deliberately exact, not a repository-shaped regular expression:
+
+- `ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9`
+- `ci-tools@sha256:2ff536627228c90e5c32b7d6345b21600a38a17481c075b41683db47ead3e862`
+
+The latter supplies Python, librsvg/fontconfig and xcursorgen for design payloads.
+Any other digest, repository or tag is refused before the container engine runs.
 
 The payload receives `PF_SOURCE_SHA`, `PF_PLATFORM_SHA`, `PF_PLATFORM_DIR`,
 `PF_IMAGE` and `SOURCE_DATE_EPOCH`. All task dependencies come from the image;

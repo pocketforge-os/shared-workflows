@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import queue
+import re
 import signal
 import tempfile
 import threading
@@ -18,6 +19,9 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("rust_ci", Path(__file__).parents[1] / "scripts/run-rust-ci.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+
+CI_RUST_IMAGE = "10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9"
+CI_TOOLS_IMAGE = "10.0.32.86:5555/pocketforge/ci-tools@sha256:2ff536627228c90e5c32b7d6345b21600a38a17481c075b41683db47ead3e862"
 
 
 def hold_lock(path, ready):
@@ -205,6 +209,33 @@ class CapacityTests(unittest.TestCase):
                        "10.0.32.86:5555/pocketforge/ci-rust:latest", "ci.sh")
             engine.assert_not_called()
 
+    def test_image_allowlist_accepts_two_exact_digests_only(self):
+        for image in (CI_RUST_IMAGE, CI_TOOLS_IMAGE):
+            with self.subTest(image=image):
+                ci.verify_image(image)
+
+        refused = (
+            CI_RUST_IMAGE[:-1] + "0",
+            CI_TOOLS_IMAGE[:-1] + "0",
+            "10.0.32.86:5555/pocketforge/ci-tools:latest",
+            "10.0.32.86:5555/pocketforge/other@sha256:" + "a" * 64,
+        )
+        for image in refused:
+            with self.subTest(image=image), self.assertRaisesRegex(
+                ci.Refused, "unpinned_image"
+            ):
+                ci.verify_image(image)
+
+    def test_workflow_and_controller_image_allowlists_match(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/rust-container.yml").read_text()
+        workflow_images = set(
+            re.findall(
+                r"10\.0\.32\.86:5555/pocketforge/[a-z-]+@sha256:[0-9a-f]{64}",
+                workflow,
+            )
+        )
+        self.assertEqual(workflow_images, ci.ALLOWED_IMAGES)
+
 
 class CapacityWaitTests(unittest.TestCase):
     """A capacity refusal while siblings are active is contention: wait, never refuse."""
@@ -361,7 +392,7 @@ class RunAdmissionTests(unittest.TestCase):
             state = root / "state"
             state.mkdir()
             sha = "a" * 40
-            image = "10.0.32.86:5555/pocketforge/ci-rust@sha256:" + "b" * 64
+            image = CI_RUST_IMAGE
             calls = []
 
             def fake_output(*args):
