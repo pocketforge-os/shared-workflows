@@ -392,7 +392,7 @@ class RunAdmissionTests(unittest.TestCase):
             state = root / "state"
             state.mkdir()
             sha = "a" * 40
-            image = "10.0.32.86:5555/pocketforge/ci-rust@sha256:" + "b" * 64
+            image = CI_RUST_IMAGE
             calls = []
 
             def fake_output(*args):
