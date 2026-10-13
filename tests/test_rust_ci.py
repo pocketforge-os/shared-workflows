@@ -129,16 +129,33 @@ class CapacityTests(unittest.TestCase):
             finally:
                 guard.close()
 
-    def test_missing_run_lock_is_alive_and_logged(self):
+    def test_missing_run_lock_with_existing_container_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy, _ = self.reservation(root, "run-legacy", lock=False)
-            with patch("builtins.print") as log, patch.object(ci.subprocess, "run") as engine:
+            present = SimpleNamespace(returncode=0, stderr="")
+            with patch("builtins.print") as log, \
+                    patch.object(ci.subprocess, "run", return_value=present) as engine:
                 self.assertEqual(ci.active_reservations(root), 1)
-            engine.assert_not_called()
+            engine.assert_called_once_with(
+                ["docker", "container", "inspect", "container-run-legacy"], timeout=20,
+                stdout=ci.subprocess.DEVNULL, stderr=ci.subprocess.PIPE, text=True)
             self.assertTrue(legacy.exists())
             event = json.loads(log.call_args.args[0])
             self.assertEqual(event["reason"], "missing_run_lock")
+
+    def test_legacy_reservation_without_lock_or_container_is_reclaimed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, _ = self.reservation(root, "run-legacy", lock=False)
+            absent = SimpleNamespace(
+                returncode=1, stderr="Error: No such container: container-run-legacy\n")
+            with patch("builtins.print") as log, \
+                    patch.object(ci.subprocess, "run", return_value=absent):
+                self.assertEqual(ci.active_reservations(root), 0)
+            self.assertFalse(legacy.exists())
+            event = json.loads(log.call_args.args[0])
+            self.assertEqual(event["reason"], "legacy_owner_gone")
 
     def test_live_disk_scan_tolerates_unlinked_rustc_intermediate_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -426,6 +443,82 @@ class RunAdmissionTests(unittest.TestCase):
             self.assertEqual(kinds, ["starting", "finished"])
             self.assertEqual(list(state.glob("run-*")), [])
             self.assertTrue(any(list(command[:3]) == ["docker", "rm", "-f"] for command in calls))
+
+    def test_accounting_emitted_for_pass_and_over_budget_refusal(self):
+        """One hermetic invocation proves both the positive and negative controls."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sha = "a" * 40
+
+            def fake_output(*args):
+                if "rev-parse" in args:
+                    return sha
+                if "status" in args:
+                    return ""
+                if "info" in args:
+                    return "/docker"
+                if "show" in args:
+                    return "0"
+                raise AssertionError(args)
+
+            def fake_run(command, **_kwargs):
+                return SimpleNamespace(returncode=0)
+
+            class Child:
+                returncode = 0
+                stdout = iter(("::group::compile\n", "::endgroup::\n"))
+
+                def __init__(self, polls):
+                    self.polls = iter(polls)
+
+                def poll(self):
+                    return next(self.polls, self.returncode)
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            def exercise(name, samples, polls, budget):
+                state = root / name
+                state.mkdir()
+                child = Child(polls)
+                with patch.object(ci, "output", side_effect=fake_output), \
+                        patch.object(ci.subprocess, "run", side_effect=fake_run), \
+                        patch.object(ci.subprocess, "Popen", return_value=child), \
+                        patch.object(ci.os, "statvfs", return_value=SimpleNamespace(
+                            f_bavail=100 * ci.GIB // 4096, f_frsize=4096,
+                            f_favail=1000000)), \
+                        patch.object(ci, "host_memory", return_value=32 * ci.GIB), \
+                        patch.object(ci, "disk_usage", side_effect=samples), \
+                        patch.object(ci.time, "sleep"), \
+                        patch("builtins.print") as log:
+                    outcome = None
+                    try:
+                        outcome = ci.run(root / "source", sha, root / "platform", sha,
+                                         CI_RUST_IMAGE, "ci.sh", root=state,
+                                         disk_budget=budget)
+                    except ci.Refused as exc:
+                        outcome = str(exc)
+                events = [json.loads(call.args[0]) for call in log.call_args_list
+                          if call.args and isinstance(call.args[0], str)
+                          and call.args[0].startswith("{")]
+                accounting = [event for event in events
+                              if event.get("rust_ci") == "disk_accounting"]
+                self.assertEqual(len(accounting), 1)
+                return outcome, accounting[0]
+
+            passed, pass_accounting = exercise("pass", [40, 40, 40], [0], 100)
+            refused, refuse_accounting = exercise(
+                "refuse", [40, 40, 80, 101], [None, None], 100)
+
+            self.assertEqual(passed, 0)
+            self.assertEqual(pass_accounting["peak_private_bytes"], 40)
+            self.assertEqual(pass_accounting["phases"], [
+                {"phase": "preflight", "peak_private_bytes": 40},
+                {"phase": "compile", "peak_private_bytes": 40},
+            ])
+            self.assertEqual(refused, "run_disk_budget")
+            self.assertGreater(refuse_accounting["peak_private_bytes"], 100)
+            self.assertEqual(refuse_accounting["budget_bytes"], 100)
 
 
 class SlotTests(unittest.TestCase):
