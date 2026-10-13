@@ -181,6 +181,42 @@ class CapacityTests(unittest.TestCase):
             with self.assertRaisesRegex(ci.Refused, "run_disk_usage_unknown"):
                 ci.disk_usage(root / "missing-run")
 
+    def test_reservation_is_locked_before_atomic_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory, guard, reservation = ci.publish_reservation(
+                root, {"disk": ci.DISK, "memory": ci.MEMORY})
+            try:
+                self.assertTrue(directory.name.startswith("run-"))
+                self.assertEqual(list(root.glob(".run-*")), [])
+                self.assertEqual(json.loads((directory / "reservation.json").read_text()),
+                                 reservation)
+                contender = (directory / "run.lock").open("a")
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        ci.fcntl.flock(contender, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+                finally:
+                    contender.close()
+            finally:
+                guard.close()
+
+    def test_cleanup_unpublishes_reservation_before_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory, guard = self.reservation(root, "run-owned")
+            ci.fcntl.flock(guard, ci.fcntl.LOCK_EX | ci.fcntl.LOCK_NB)
+            removed = []
+            unlink = Path.unlink
+
+            def tracked_unlink(path, *args, **kwargs):
+                removed.append(path.name)
+                return unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", tracked_unlink):
+                ci.cleanup_reservation(directory, guard)
+            self.assertEqual(removed[:2], ["reservation.json", "run.lock"])
+            self.assertFalse(directory.exists())
+
     def fs(self, size=100 * ci.GIB, inodes=1000000):
         return SimpleNamespace(f_bavail=size // 4096, f_frsize=4096, f_favail=inodes)
 
@@ -529,6 +565,24 @@ class RunAdmissionTests(unittest.TestCase):
             self.assertEqual(refused, "run_disk_budget")
             self.assertGreater(refuse_accounting["peak_private_bytes"], 100)
             self.assertEqual(refuse_accounting["budget_bytes"], 100)
+
+
+class RefusalReportingTests(unittest.TestCase):
+    def test_every_refusal_reports_active_reservations_and_available_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for number in range(2):
+                directory = root / f"run-{number}"
+                directory.mkdir()
+                (directory / "reservation.json").write_text("{}")
+            with patch.object(ci, "host_memory", return_value=123456):
+                event = ci.refusal_event(ci.Refused("memory_capacity"), root)
+            self.assertEqual(event, {
+                "rust_ci": "refused",
+                "reason": "memory_capacity",
+                "active": 2,
+                "available_memory": 123456,
+            })
 
 
 class SlotTests(unittest.TestCase):
