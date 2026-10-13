@@ -174,17 +174,51 @@ def inspect_reserved_container(name):
     raise OSError("container identity unconfirmed")
 
 
-def active_reservations(root):
+def other_slot_owner_alive(root, owned_slot=None):
+    """Fail safe if any pool slot except the caller's is still kernel-locked."""
+    owned_identity = None
+    if owned_slot is not None:
+        try:
+            info = os.fstat(owned_slot.fileno())
+            owned_identity = (info.st_dev, info.st_ino)
+        except OSError:
+            return True
+    for number in range(2):
+        guard = None
+        try:
+            guard = (root / f"slot-{number}.lock").open("a")
+            info = os.fstat(guard.fileno())
+            if (info.st_dev, info.st_ino) == owned_identity:
+                continue
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        except OSError:
+            return True
+        finally:
+            if guard is not None:
+                guard.close()
+    return False
+
+
+def active_reservations(root, *, owned_slot=None):
     """Count live reservations and reclaim only provably dead owners."""
     active = 0
     for reservation_path in root.glob("run-*/reservation.json"):
         directory = reservation_path.parent
         lock_path = directory / "run.lock"
         if not lock_path.exists():
-            # Releases before 3200063 created reservation.json without a lifetime
-            # lock. Upgrade leftovers are safe to remove only when the engine
-            # proves their exact recorded container is absent. A present or
-            # unconfirmable container remains reserved; absence is never inferred.
+            # Releases before 3200063 created reservation.json without a per-run
+            # lock, but held a pool slot for the controller's whole lifetime.
+            # Reclaim only after no non-caller slot owner remains AND the engine
+            # proves the exact recorded container absent. Every uncertainty keeps.
+            if other_slot_owner_alive(root, owned_slot):
+                print(json.dumps({"rust_ci": "reservation_alive",
+                                  "reason": "legacy_owner_slot_alive",
+                                  "directory": str(directory)}), flush=True)
+                active += 1
+                continue
             try:
                 reservation = json.loads(reservation_path.read_text())
                 name = reservation["name"]
@@ -340,7 +374,7 @@ def admit(root, reserve, *, slot=None, wait_seconds=SLOT_WAIT_SECONDS):
             slot = acquire_slots(root, wait_seconds=max(0, deadline - time.monotonic()))[0]
         try:
             with admission():
-                active = active_reservations(root)
+                active = active_reservations(root, owned_slot=slot)
                 try:
                     result = reserve(active)
                 except Refused as exc:
