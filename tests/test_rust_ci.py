@@ -428,7 +428,8 @@ class RunAdmissionTests(unittest.TestCase):
                 calls.append(tuple(command))
                 return SimpleNamespace(returncode=0)
 
-            child = SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0)
+            child = SimpleNamespace(returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0,
+                                    stdout=iter(()))
             with patch.object(ci, "output", side_effect=fake_output), \
                     patch.object(ci.subprocess, "run", side_effect=fake_run), \
                     patch.object(ci.subprocess, "Popen", return_value=child), \
@@ -440,7 +441,7 @@ class RunAdmissionTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             kinds = [json.loads(c.args[0])["rust_ci"] for c in log.call_args_list
                      if c.args and isinstance(c.args[0], str) and c.args[0].startswith("{")]
-            self.assertEqual(kinds, ["starting", "finished"])
+            self.assertEqual(kinds, ["starting", "finished", "disk_accounting"])
             self.assertEqual(list(state.glob("run-*")), [])
             self.assertTrue(any(list(command[:3]) == ["docker", "rm", "-f"] for command in calls))
 
@@ -481,6 +482,12 @@ class RunAdmissionTests(unittest.TestCase):
                 state = root / name
                 state.mkdir()
                 child = Child(polls)
+                readings = iter(samples)
+                last = samples[-1]
+
+                def disk_sample(_directory):
+                    return next(readings, last)
+
                 with patch.object(ci, "output", side_effect=fake_output), \
                         patch.object(ci.subprocess, "run", side_effect=fake_run), \
                         patch.object(ci.subprocess, "Popen", return_value=child), \
@@ -488,7 +495,7 @@ class RunAdmissionTests(unittest.TestCase):
                             f_bavail=100 * ci.GIB // 4096, f_frsize=4096,
                             f_favail=1000000)), \
                         patch.object(ci, "host_memory", return_value=32 * ci.GIB), \
-                        patch.object(ci, "disk_usage", side_effect=samples), \
+                        patch.object(ci, "disk_usage", side_effect=disk_sample), \
                         patch.object(ci.time, "sleep"), \
                         patch("builtins.print") as log:
                     outcome = None
@@ -507,8 +514,7 @@ class RunAdmissionTests(unittest.TestCase):
                 return outcome, accounting[0]
 
             passed, pass_accounting = exercise("pass", [40, 40, 40], [0], 100)
-            refused, refuse_accounting = exercise(
-                "refuse", [40, 40, 80, 101], [None, None], 100)
+            refused, refuse_accounting = exercise("refuse", [101], [None], 100)
 
             self.assertEqual(passed, 0)
             self.assertEqual(pass_accounting["peak_private_bytes"], 40)

@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 GIB = 1024**3
@@ -97,6 +98,18 @@ def remove_reserved_container(name):
     return inspected.returncode == 1 and missing in inspected.stderr.splitlines()
 
 
+def inspect_reserved_container(name):
+    """Return present/absent only when the engine proves the exact identity."""
+    inspected = subprocess.run(["docker", "container", "inspect", name], timeout=20,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if inspected.returncode == 0:
+        return True
+    missing = f"Error: No such container: {name}"
+    if inspected.returncode == 1 and missing in inspected.stderr.splitlines():
+        return False
+    raise OSError("container identity unconfirmed")
+
+
 def active_reservations(root):
     """Count live reservations and reclaim only provably dead owners."""
     active = 0
@@ -104,9 +117,32 @@ def active_reservations(root):
         directory = reservation_path.parent
         lock_path = directory / "run.lock"
         if not lock_path.exists():
-            print(json.dumps({"rust_ci": "reservation_alive", "reason": "missing_run_lock",
-                              "directory": str(directory)}), flush=True)
-            active += 1
+            # Releases before 3200063 created reservation.json without a lifetime
+            # lock. Upgrade leftovers are safe to remove only when the engine
+            # proves their exact recorded container is absent. A present or
+            # unconfirmable container remains reserved; absence is never inferred.
+            try:
+                reservation = json.loads(reservation_path.read_text())
+                name = reservation["name"]
+                if not isinstance(name, str) or not name:
+                    raise ValueError("invalid container name")
+                present = inspect_reserved_container(name)
+                if present:
+                    print(json.dumps({"rust_ci": "reservation_alive",
+                                      "reason": "missing_run_lock", "name": name,
+                                      "directory": str(directory)}), flush=True)
+                    active += 1
+                else:
+                    shutil.rmtree(directory)
+                    print(json.dumps({"rust_ci": "reclaimed",
+                                      "reason": "legacy_owner_gone", "name": name,
+                                      "directory": str(directory)}), flush=True)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
+                    subprocess.TimeoutExpired):
+                print(json.dumps({"rust_ci": "reservation_alive",
+                                  "reason": "legacy_owner_unconfirmed",
+                                  "directory": str(directory)}), flush=True)
+                active += 1
             continue
         guard = lock_path.open("a")
         try:
@@ -299,21 +335,77 @@ def disk_usage(root):
     return total
 
 
-def run(source, source_sha, platform, platform_sha, image, script, *, root=None, slot_fd=None):
-    verify_image(image)
-    if not re.fullmatch(r"[A-Za-z0-9_./-]+\.sh", script) or ".." in script or script.startswith("/"):
-        raise Refused("invalid_script")
-    verify_source(source, source_sha)
-    verify_source(platform, platform_sha)
-    # Archive only committed files: no checkout tokens, .git, host homes or tools.
-    root = Path(root or state_root())
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+class DiskAccounting:
+    """Thread-safe sampled peaks for run-private allocated bytes."""
+
+    def __init__(self, budget):
+        self.budget = budget
+        self.peak = 0
+        self.phase = "preflight"
+        self.phases = {self.phase: 0}
+        self.lock = threading.Lock()
+
+    def observe(self, used):
+        with self.lock:
+            self.peak = max(self.peak, used)
+            if self.phase is not None:
+                self.phases[self.phase] = max(self.phases.get(self.phase, 0), used)
+
+    def enforce(self, used):
+        self.observe(used)
+        if used > self.budget:
+            raise Refused("run_disk_budget")
+
+    def start_phase(self, name, used):
+        with self.lock:
+            self.peak = max(self.peak, used)
+            self.phase = name
+            self.phases[name] = max(self.phases.get(name, 0), used)
+
+    def finish_phase(self, used):
+        self.observe(used)
+        with self.lock:
+            self.phase = None
+
+    def event(self):
+        with self.lock:
+            return {
+                "rust_ci": "disk_accounting",
+                "budget_bytes": self.budget,
+                "peak_private_bytes": self.peak,
+                "phases": [{"phase": phase, "peak_private_bytes": peak}
+                           for phase, peak in self.phases.items()],
+            }
+
+
+def relay_container_output(stream, directory, accounting, errors):
+    """Preserve workload output while assigning boundary samples to its groups."""
+    try:
+        for line in stream:
+            print(line, end="", flush=True)
+            if line.startswith("::group::"):
+                used = disk_usage(directory)
+                accounting.enforce(used)
+                accounting.start_phase(line.removeprefix("::group::").strip(), used)
+            elif line.strip() == "::endgroup::":
+                used = disk_usage(directory)
+                accounting.enforce(used)
+                accounting.finish_phase(used)
+    except BaseException as exc:
+        errors.append(exc)
+
+
+def run(source, source_sha, platform, platform_sha, image, script, *, root=None, slot_fd=None,
+        disk_budget=DISK):
+    accounting = DiskAccounting(disk_budget)
     directory = None
     name = None
     cleaned = True
     slot = None
     run_guard = None
     child = None
+    reader = None
+    reader_errors = []
 
     def reserve(active):
         """Capacity verdict and durable reservation, atomic under the admission lock."""
@@ -335,6 +427,15 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
         return reservation
 
     try:
+        verify_image(image)
+        if (not re.fullmatch(r"[A-Za-z0-9_./-]+\.sh", script) or ".." in script
+                or script.startswith("/")):
+            raise Refused("invalid_script")
+        verify_source(source, source_sha)
+        verify_source(platform, platform_sha)
+        # Archive only committed files: no checkout tokens, .git, host homes or tools.
+        root = Path(root or state_root())
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if slot_fd is not None:
             slot = adopt_slot(root, slot_fd)
         slot, reservation = admit(root, reserve, slot=slot)
@@ -367,14 +468,24 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
         cleaned = False  # Even a failed create can have allocated an engine object.
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
         print(json.dumps({"rust_ci": "starting", **reservation}), flush=True)
-        child = subprocess.Popen(["docker", "start", "--attach", name])
+        child = subprocess.Popen(["docker", "start", "--attach", name], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        reader = threading.Thread(target=relay_container_output,
+                                  args=(child.stdout, directory, accounting, reader_errors),
+                                  daemon=True)
+        reader.start()
         while child.poll() is None:
             # Run-private output budget; no unbounded target/cache exports. Admission
             # is conservative accounting, not an underlying filesystem hard quota.
             used = disk_usage(directory)
-            if used > DISK:
-                raise Refused("run_disk_budget")
+            accounting.enforce(used)
             time.sleep(2)
+        reader.join(timeout=10)
+        if reader.is_alive():
+            raise Refused("run_output_stream_stalled")
+        if reader_errors:
+            raise reader_errors[0]
+        accounting.enforce(disk_usage(directory))
         rc = child.returncode
         print(json.dumps({"rust_ci": "finished", "name": name, "exit_code": rc}), flush=True)
         return rc
@@ -390,13 +501,20 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
                     cleaned = result.returncode == 0
                 except (OSError, subprocess.TimeoutExpired):
                     cleaned = False
+            if child is not None and cleaned:
+                child.wait(timeout=10)
+                if reader is not None:
+                    reader.join(timeout=10)
+            if directory and directory.exists():
+                try:
+                    accounting.observe(disk_usage(directory))
+                except Refused:
+                    pass
             if directory and cleaned:
                 shutil.rmtree(directory)
             elif directory:
                 print(json.dumps({"rust_ci": "retained", "reason": "engine_cleanup_unconfirmed",
                                   "directory": str(directory)}), flush=True)
-            if child is not None and cleaned:
-                child.wait(timeout=10)
         finally:
             if slot:
                 slot.close()
@@ -404,6 +522,7 @@ def run(source, source_sha, platform, platform_sha, image, script, *, root=None,
                 run_guard.close()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+            print(json.dumps(accounting.event()), flush=True)
 
 
 def interrupted(signum, _frame):
