@@ -157,6 +157,36 @@ class CapacityTests(unittest.TestCase):
             event = json.loads(log.call_args.args[0])
             self.assertEqual(event["reason"], "legacy_owner_gone")
 
+    def test_lockless_reservation_is_preserved_while_legacy_slot_owner_lives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, _ = self.reservation(root, "run-legacy", lock=False)
+            owner = ci.acquire_slots(root, wait_seconds=0)[0]
+            try:
+                with patch("builtins.print") as log, \
+                        patch.object(ci.subprocess, "run") as engine:
+                    self.assertEqual(ci.active_reservations(root), 1)
+                engine.assert_not_called()
+                self.assertTrue(legacy.exists())
+                event = json.loads(log.call_args.args[0])
+                self.assertEqual(event["reason"], "legacy_owner_slot_alive")
+            finally:
+                owner.close()
+
+    def test_caller_slot_is_not_mistaken_for_legacy_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy, _ = self.reservation(root, "run-legacy", lock=False)
+            caller = ci.acquire_slots(root, wait_seconds=0)[0]
+            absent = SimpleNamespace(
+                returncode=1, stderr="Error: No such container: container-run-legacy\n")
+            try:
+                with patch.object(ci.subprocess, "run", return_value=absent):
+                    self.assertEqual(ci.active_reservations(root, owned_slot=caller), 0)
+            finally:
+                caller.close()
+            self.assertFalse(legacy.exists())
+
     def test_live_disk_scan_tolerates_unlinked_rustc_intermediate_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
