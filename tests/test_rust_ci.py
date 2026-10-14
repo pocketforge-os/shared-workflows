@@ -789,17 +789,8 @@ sys.exit(2)
 '''
 
 
-class SlotContentionSubrunRefusalTests(unittest.TestCase):
-    """The real control process against stub sub-runs: no docker/git/network.
-
-    A sub-run's typed environmental capacity refusal (rc 75 plus its typed
-    line) must surface as the control's own typed refusal (rc 75), never as
-    an rc-1 failure of unrelated PRs and never as a pass of the property.
-    Any other sub-run outcome (rc 0 without the marker, a non-75 failure, or
-    rc 75 with a non-capacity reason) is a real semantics break: rc 1.
-    """
-
-    REFUSED_LINE = "rust_ci_control=refused reason=capacity_slots_timeout"
+class SlotContentionControlBase(unittest.TestCase):
+    """Shared scaffolding: the real control copied beside the hermetic stubs."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="pf-slot-contention-refusal-")
@@ -814,15 +805,32 @@ class SlotContentionSubrunRefusalTests(unittest.TestCase):
             LIVE_STUB.replace("__RUN_RUST_CI__", str(tests.parent / "scripts/run-rust-ci.py")))
         (control_dir / "controller.py").write_text(CONTROLLER_STUB)
         self.work = self.root / "runs" / "work"
+        self.state = self.root / "state"
 
-    def run_control(self, mode):
-        env = dict(os.environ, STUB_WORK=str(self.work), STUB_MODE=mode)
+    def run_control(self, mode, drop_env=()):
+        env = dict(os.environ, STUB_WORK=str(self.work), STUB_MODE=mode,
+                   STUB_STATE=str(self.state))
+        for key in drop_env:
+            env.pop(key, None)
         return subprocess.run([sys.executable, str(self.control), "--image", CI_RUST_IMAGE],
                               capture_output=True, text=True, timeout=240,
                               env=env, cwd=str(self.control.parent))
 
     def failure(self, result):
         return f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+class SlotContentionSubrunRefusalTests(SlotContentionControlBase):
+    """The real control process against stub sub-runs: no docker/git/network.
+
+    A sub-run's typed environmental capacity refusal (rc 75 plus its typed
+    line) must surface as the control's own typed refusal (rc 75), never as
+    an rc-1 failure of unrelated PRs and never as a pass of the property.
+    Any other sub-run outcome (rc 0 without the marker, a non-75 failure, or
+    rc 75 with a non-capacity reason) is a real semantics break: rc 1.
+    """
+
+    REFUSED_LINE = "rust_ci_control=refused reason=capacity_slots_timeout"
 
     def test_healthy_subruns_pass_the_control(self):
         result = self.run_control("")
@@ -866,6 +874,32 @@ class SlotContentionSubrunRefusalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, self.failure(result))
         self.assertNotIn("rust_ci_control=refused", result.stdout)
         self.assertNotIn("rust_ci_control=pass", result.stdout)
+
+
+class HermeticStateRootIsolationTests(SlotContentionControlBase):
+    """Hermetic control runs must never touch the VM-wide real state root.
+
+    LIVE_STUB keeps the real run-rust-ci.py module, so without an explicit
+    override ci.state_root() points fixture_admission at the shared
+    /tmp/pf-rust-ci-<uid>/contention-fixture.lock that live CI jobs hold for
+    minutes at a time: the hermetic subprocess then starves until its 240s
+    test timeout (pocketforge-automation#1460). The stub must bind state_root
+    to the test's private STUB_STATE directory, and fail closed without it.
+    """
+
+    def test_admission_locks_only_the_private_stub_state_root(self):
+        result = self.run_control("")
+        self.assertEqual(result.returncode, 0, self.failure(result))
+        self.assertIn("rust_ci_control=pass case=ordinary_sibling_then_atomic_cohort",
+                      result.stdout)
+        self.assertTrue((self.state / "contention-fixture.lock").exists(),
+                        f"stub admission never used STUB_STATE={self.state}\n"
+                        + self.failure(result))
+
+    def test_missing_stub_state_fails_closed_not_the_real_root(self):
+        result = self.run_control("", drop_env=("STUB_STATE",))
+        self.assertNotEqual(result.returncode, 0, self.failure(result))
+        self.assertIn("STUB_STATE", result.stderr)
 
 
 class ControlsStepTypedSkipTests(unittest.TestCase):
