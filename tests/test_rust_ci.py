@@ -868,5 +868,83 @@ class SlotContentionSubrunRefusalTests(unittest.TestCase):
         self.assertNotIn("rust_ci_control=pass", result.stdout)
 
 
+class ControlsStepTypedSkipTests(unittest.TestCase):
+    """The workflow maps the control's typed refusal to a visible skip.
+
+    Runs the committed `id: controls` step script under bash with a fake
+    python3 on PATH: rc 75 plus the typed refused line is a green, loud skip
+    (output, step summary, warning annotation, never a pass of the property);
+    rc 75 without the typed line and every other rc stay red.
+    """
+
+    WORKFLOW = Path(__file__).parents[1] / ".github/workflows/rust-container.yml"
+
+    def step_script(self):
+        lines = self.WORKFLOW.read_text().splitlines()
+        start = lines.index("        id: controls")
+        run = lines.index("        run: |", start)
+        script = []
+        for line in lines[run + 1:]:
+            if line.strip() and not line.startswith("          "):
+                break
+            script.append(line[10:] if line.startswith("          ") else "")
+        return "\n".join(script) + "\n"
+
+    def run_step(self, root, rc, out):
+        shim = root / "bin"
+        shim.mkdir()
+        (shim / "python3").write_text('#!/bin/sh\necho "$FAKE_OUT"\nexit "$FAKE_RC"\n')
+        (shim / "python3").chmod(0o755)
+        script = root / "step.sh"
+        script.write_text(self.step_script())
+        env = dict(os.environ, PATH=f"{shim}:{os.environ['PATH']}", FAKE_RC=str(rc),
+                   FAKE_OUT=out, RUNNER_TEMP=str(root), GITHUB_OUTPUT=str(root / "output"),
+                   GITHUB_STEP_SUMMARY=str(root / "summary"))
+        return subprocess.run(["bash", "-e", str(script)], capture_output=True,
+                              text=True, timeout=60, env=env)
+
+    def read(self, root, name):
+        path = root / name
+        return path.read_text() if path.exists() else ""
+
+    def test_typed_refusal_is_a_loud_green_skip(self):
+        with tempfile.TemporaryDirectory(prefix="pf-controls-step-") as tmp:
+            root = Path(tmp)
+            result = self.run_step(root, 75, "rust_ci_control=refused reason=capacity_slots_timeout")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.read(root, "output"), "controls-refusal=capacity_slots_timeout\n")
+            summary = self.read(root, "summary")
+            self.assertIn("capacity_slots_timeout", summary)
+            self.assertIn("NOT passed", summary)
+            self.assertIn("::warning::rust_ci_control=refused reason=capacity_slots_timeout", result.stdout)
+
+    def test_rc75_without_typed_line_stays_red(self):
+        with tempfile.TemporaryDirectory(prefix="pf-controls-step-") as tmp:
+            root = Path(tmp)
+            result = self.run_step(root, 75, "segfault or any other untyped exit")
+            self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+            self.assertEqual(self.read(root, "output"), "")
+
+    def test_real_control_failure_stays_red(self):
+        with tempfile.TemporaryDirectory(prefix="pf-controls-step-") as tmp:
+            root = Path(tmp)
+            result = self.run_step(root, 1, "AssertionError: spare slot semantics broke")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(self.read(root, "output"), "")
+
+    def test_pass_run_keeps_no_refusal_output(self):
+        with tempfile.TemporaryDirectory(prefix="pf-controls-step-") as tmp:
+            root = Path(tmp)
+            result = self.run_step(root, 0, "rust_ci_control=pass case=ordinary_sibling_then_atomic_cohort")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.read(root, "output"), "")
+
+    def test_refusal_output_is_exposed_to_callers_and_timeout_unchanged(self):
+        text = self.WORKFLOW.read_text()
+        self.assertIn("controls-refusal: ${{ steps.controls.outputs.controls-refusal }}", text)
+        self.assertIn("value: ${{ jobs.container.outputs.controls-refusal }}", text)
+        self.assertEqual(text.count("timeout-minutes: 30"), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
