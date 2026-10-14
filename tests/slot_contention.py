@@ -15,6 +15,30 @@ import live_rust_ci as live
 
 CONTROLLER = live.CONTROLLER
 
+# Environmental capacity refusals a sub-run may report on a busy pool. They
+# are a typed skip of this control, never a verdict on the property under
+# test; every other sub-run outcome (including rc 75 with a non-capacity
+# reason such as source_identity) stays a hard rc-1 control failure.
+CAPACITY_REFUSALS = frozenset(live.ci.CAPACITY_REASONS) | {
+    "capacity_slots_timeout", "admission_busy"}
+
+
+def subrun_capacity_refusal(returncode, text):
+    """A sub-run's typed environmental capacity refusal reason, else None."""
+    if returncode != 75:
+        return None
+    reason = None
+    for line in text.splitlines():
+        if line.startswith('{"rust_ci": "refused"'):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            reason = event.get("reason")
+        elif line.startswith("rust_ci_control=refused reason="):
+            reason = line.split("reason=", 1)[1].strip()
+    return reason if reason in CAPACITY_REFUSALS else None
+
 
 @contextlib.contextmanager
 def fixture_admission(root, wait_seconds=live.ci.SLOT_WAIT_SECONDS):
@@ -64,7 +88,11 @@ echo normal_sibling=pass
                 children.append(normal)
 
             def identity():
-                assert normal.poll() is None, logs[0].read_text()
+                if normal.poll() is not None:
+                    reason = subrun_capacity_refusal(normal.returncode, logs[0].read_text())
+                    if reason is not None:
+                        raise live.ci.Refused(reason)
+                    raise AssertionError(logs[0].read_text())
                 for line in logs[0].read_text().splitlines():
                     if line.startswith('{"rust_ci": "starting"'):
                         return json.loads(line)["name"]
@@ -77,16 +105,36 @@ echo normal_sibling=pass
                 cohort = subprocess.Popen([sys.executable, str(Path(live.__file__)), "--image", args.image],
                                           stdout=stream, stderr=subprocess.STDOUT)
                 children.append(cohort)
-            live.wait_for(lambda: '"rust_ci": "waiting_for_slots", "count": 2' in logs[1].read_text())
+            def cohort_waiting():
+                text = logs[1].read_text()
+                if '"rust_ci": "waiting_for_slots", "count": 2' in text:
+                    return True
+                if cohort.poll() is not None:
+                    reason = subrun_capacity_refusal(cohort.returncode, text)
+                    if reason is not None:
+                        raise live.ci.Refused(reason)
+                    raise AssertionError(text)
+                return False
+
+            live.wait_for(cohort_waiting)
             # Pair acquisition cannot hold the spare slot while the first is
             # busy: a second ordinary invocation still executes successfully.
             quick = subprocess.run(command + ["--script", "quick.sh"], capture_output=True, text=True, timeout=660)
+            reason = subrun_capacity_refusal(quick.returncode, quick.stdout + quick.stderr)
+            if reason is not None:
+                raise live.ci.Refused(reason)
             assert quick.returncode == 0 and "spare_slot_normal=pass" in quick.stdout, quick
             assert normal.poll() is None and cohort.poll() is None
             assert (work / "normal-cache").read_text() == "keep"
             (work / "release").touch()
             assert normal.wait(timeout=30) == 0, logs[0].read_text()
-            assert cohort.wait(timeout=660) == 0, logs[1].read_text()
+            cohort_rc = cohort.wait(timeout=660)
+            # The cohort announces waiting_for_slots before it holds the pair;
+            # its own acquisition deadline can still expire on a busy pool.
+            reason = subrun_capacity_refusal(cohort_rc, logs[1].read_text())
+            if reason is not None:
+                raise live.ci.Refused(reason)
+            assert cohort_rc == 0, logs[1].read_text()
             assert "case=concurrent_cache_and_cancel_isolation" in logs[1].read_text()
             assert not work.parent.exists()
             print("rust_ci_control=pass case=ordinary_sibling_then_atomic_cohort spare_slot_preserved=true", flush=True)

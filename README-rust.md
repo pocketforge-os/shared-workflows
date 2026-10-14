@@ -77,6 +77,14 @@ boundedly when the control cohort temporarily owns both slots. Expiry reports
 sibling state. Profile CI's `tests/slot_contention.py` holds a real normal sibling,
 observes the waiting cohort, runs another normal job in the spare slot, then
 releases the sibling and proves the cache/cancellation controls complete.
+A sub-run that reports a typed environmental capacity refusal (rc 75 plus its
+`rust_ci`/`rust_ci_control` refused line) makes the control exit 75 with
+`rust_ci_control=refused reason=...` instead of failing on a bare assert; any
+other sub-run outcome, including rc 75 with a non-capacity reason such as
+`source_identity`, still fails the control. The workflow step maps that typed
+refusal to a visible skip (warning annotation, step summary, `controls-refusal`
+output) — never a pass of the spare-slot property, never a red job for an
+unrelated change on a busy pool.
 Synthetic contention-fixture owners additionally serialize on a test-only lock
 so concurrent profile validations cannot each park a sibling indefinitely.
 Ordinary callers do not acquire that fixture lock.

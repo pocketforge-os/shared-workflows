@@ -5,6 +5,9 @@ on:
       refusal-reason:
         description: Admission refusal reason, empty when the payload was admitted
         value: ${{ jobs.container.outputs.refusal-reason }}
+      controls-refusal:
+        description: Environmental capacity refusal of the live controls, empty when they ran or failed
+        value: ${{ jobs.container.outputs.controls-refusal }}
     inputs:
       source-sha:
         description: Exact caller candidate or synthetic merge SHA (normally github.sha)
@@ -37,6 +40,7 @@ jobs:
     name: Rust container
     outputs:
       refusal-reason: ${{ steps.rust-ci.outputs.refusal-reason }}
+      controls-refusal: ${{ steps.controls.outputs.controls-refusal }}
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -87,11 +91,26 @@ jobs:
           test "$(git -C shared rev-parse HEAD)" = "$WORKFLOW_SHA"
           python3 shared/tests/test_rust_ci.py
       - name: Real missing-tool, concurrent-cache and cancellation controls
+        id: controls
         if: inputs.verify-controls
         env:
           IMAGE: ${{ inputs.image }}
         run: |
-          python3 shared/tests/slot_contention.py --image "$IMAGE"
+          set +e
+          python3 shared/tests/slot_contention.py --image "$IMAGE" 2>&1 | tee "$RUNNER_TEMP/slot-contention.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          if [[ "$result" != 75 ]]; then
+            exit "$result"
+          fi
+          reason="$(sed -n 's/^rust_ci_control=refused reason=\([^ ]*\).*$/\1/p' "$RUNNER_TEMP/slot-contention.log" | tail -n 1)"
+          if [[ -z "$reason" ]]; then
+            echo "controls exited 75 without a typed refusal line" >&2
+            exit 75
+          fi
+          printf 'controls-refusal=%s\n' "$reason" >> "$GITHUB_OUTPUT"
+          printf 'Live controls refused for capacity (`%s`): skipped, NOT passed; the spare-slot property is unverified on this run.\n' "$reason" >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::rust_ci_control=refused reason=${reason} - live controls skipped (environmental), not passed"
       - name: Run committed payload with poisoned host task tools
         id: rust-ci
         env:
