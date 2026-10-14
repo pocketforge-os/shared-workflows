@@ -8,6 +8,8 @@ import os
 import queue
 import re
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -685,6 +687,185 @@ class SlotTests(unittest.TestCase):
             pair[0].close()
             with self.assertRaisesRegex(ci.Refused, "capacity_slots_timeout"):
                 ci.acquire_slots(root, wait_seconds=0)
+
+
+LIVE_STUB = '''\
+"""Hermetic stub of live_rust_ci: fakes git/docker, keeps the real ci module."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import time
+
+CONTROLLER = Path(__file__).parent / "controller.py"
+_spec = importlib.util.spec_from_file_location("rust_ci", Path("__RUN_RUST_CI__"))
+ci = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ci)
+
+
+def checked(*args, **kwargs):
+    if args[0] == "docker":
+        return json.dumps([{"Mounts": [{"Source": os.environ["STUB_WORK"],
+                                        "Destination": "/work"}]}])
+    if args[0] == "git" and "rev-parse" in args:
+        return "0" * 40
+    if args[0] == "git":
+        return ""
+    raise AssertionError(f"unexpected checked call: {args}")
+
+
+def wait_for(predicate, seconds=90):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise AssertionError("bounded wait expired")
+
+
+if __name__ == "__main__":
+    work = Path(os.environ["STUB_WORK"])
+    if os.environ.get("STUB_MODE") == "cohort_refuse":
+        print("rust_ci_control=refused reason=capacity_slots_timeout", flush=True)
+        sys.exit(75)
+    print(json.dumps({"rust_ci": "waiting_for_slots", "count": 2,
+                      "timeout_seconds": 600}), flush=True)
+    while not (work / "release").exists():
+        time.sleep(0.05)
+    time.sleep(0.5)
+    print("rust_ci_control=pass case=concurrent_cache_and_cancel_isolation "
+          "spare_slot_preserved=true", flush=True)
+    shutil.rmtree(work.parent)
+    sys.exit(0)
+'''
+
+CONTROLLER_STUB = '''\
+"""Hermetic stub of the run-rust-ci.py CLI: one sub-run role per invocation."""
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+args = sys.argv[1:]
+script = args[args.index("--script") + 1]
+work = Path(os.environ["STUB_WORK"])
+mode = os.environ.get("STUB_MODE", "")
+
+if script == "normal.sh":
+    if mode == "normal_refuse":
+        print(json.dumps({"rust_ci": "refused", "reason": "capacity_slots_timeout",
+                          "active": 2, "available_memory": 1234567}), flush=True)
+        sys.exit(75)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "normal-cache").write_text("keep")
+    print(json.dumps({"rust_ci": "starting", "name": "pf-rust-stub-normal"}), flush=True)
+    (work / "ready").touch()
+    while not (work / "release").exists():
+        time.sleep(0.05)
+    print("normal_sibling=pass", flush=True)
+    sys.exit(0)
+
+if script == "quick.sh":
+    if mode == "quick_refuse":
+        print(json.dumps({"rust_ci": "refused", "reason": "capacity_slots_timeout",
+                          "active": 2, "available_memory": 1234567}), flush=True)
+        sys.exit(75)
+    if mode == "quick_identity_refuse":
+        print(json.dumps({"rust_ci": "refused", "reason": "source_identity",
+                          "active": 0, "available_memory": 1234567}), flush=True)
+        sys.exit(75)
+    if mode == "quick_empty":
+        sys.exit(0)
+    if mode == "quick_fail":
+        sys.exit(3)
+    print("spare_slot_normal=pass", flush=True)
+    sys.exit(0)
+
+sys.exit(2)
+'''
+
+
+class SlotContentionSubrunRefusalTests(unittest.TestCase):
+    """The real control process against stub sub-runs: no docker/git/network.
+
+    A sub-run's typed environmental capacity refusal (rc 75 plus its typed
+    line) must surface as the control's own typed refusal (rc 75), never as
+    an rc-1 failure of unrelated PRs and never as a pass of the property.
+    Any other sub-run outcome (rc 0 without the marker, a non-75 failure, or
+    rc 75 with a non-capacity reason) is a real semantics break: rc 1.
+    """
+
+    REFUSED_LINE = "rust_ci_control=refused reason=capacity_slots_timeout"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="pf-slot-contention-refusal-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        control_dir = self.root / "control"
+        control_dir.mkdir()
+        tests = Path(__file__).parent
+        self.control = control_dir / "slot_contention.py"
+        self.control.write_bytes((tests / "slot_contention.py").read_bytes())
+        (control_dir / "live_rust_ci.py").write_text(
+            LIVE_STUB.replace("__RUN_RUST_CI__", str(tests.parent / "scripts/run-rust-ci.py")))
+        (control_dir / "controller.py").write_text(CONTROLLER_STUB)
+        self.work = self.root / "runs" / "work"
+
+    def run_control(self, mode):
+        env = dict(os.environ, STUB_WORK=str(self.work), STUB_MODE=mode)
+        return subprocess.run([sys.executable, str(self.control), "--image", CI_RUST_IMAGE],
+                              capture_output=True, text=True, timeout=240,
+                              env=env, cwd=str(self.control.parent))
+
+    def failure(self, result):
+        return f"rc={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    def test_healthy_subruns_pass_the_control(self):
+        result = self.run_control("")
+        self.assertEqual(result.returncode, 0, self.failure(result))
+        self.assertIn("rust_ci_control=pass case=ordinary_sibling_then_atomic_cohort",
+                      result.stdout)
+
+    def test_quick_capacity_refusal_exits_75_typed_not_1(self):
+        result = self.run_control("quick_refuse")
+        self.assertEqual(result.returncode, 75, self.failure(result))
+        self.assertIn(self.REFUSED_LINE, result.stdout)
+        self.assertNotIn("rust_ci_control=pass", result.stdout)
+        self.assertNotIn("spare_slot_normal=pass", result.stdout)
+
+    def test_normal_startup_capacity_refusal_exits_75_typed(self):
+        result = self.run_control("normal_refuse")
+        self.assertEqual(result.returncode, 75, self.failure(result))
+        self.assertIn(self.REFUSED_LINE, result.stdout)
+        self.assertNotIn("rust_ci_control=pass", result.stdout)
+
+    def test_cohort_capacity_refusal_exits_75_typed(self):
+        result = self.run_control("cohort_refuse")
+        self.assertEqual(result.returncode, 75, self.failure(result))
+        self.assertIn(self.REFUSED_LINE, result.stdout)
+        self.assertNotIn("rust_ci_control=pass", result.stdout)
+
+    def test_quick_zero_without_marker_still_fails(self):
+        result = self.run_control("quick_empty")
+        self.assertEqual(result.returncode, 1, self.failure(result))
+        self.assertNotIn("rust_ci_control=refused", result.stdout)
+        self.assertNotIn("rust_ci_control=pass", result.stdout)
+
+    def test_quick_non75_failure_still_fails(self):
+        result = self.run_control("quick_fail")
+        self.assertEqual(result.returncode, 1, self.failure(result))
+        self.assertNotIn("rust_ci_control=refused", result.stdout)
+        self.assertNotIn("rust_ci_control=pass", result.stdout)
+
+    def test_quick_rc75_with_non_capacity_reason_still_fails(self):
+        result = self.run_control("quick_identity_refuse")
+        self.assertEqual(result.returncode, 1, self.failure(result))
+        self.assertNotIn("rust_ci_control=refused", result.stdout)
+        self.assertNotIn("rust_ci_control=pass", result.stdout)
 
 
 if __name__ == "__main__":
