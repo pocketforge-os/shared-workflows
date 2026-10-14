@@ -704,6 +704,17 @@ _spec = importlib.util.spec_from_file_location("rust_ci", Path("__RUN_RUST_CI__"
 ci = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ci)
 
+# Hermetic admission must never share the VM-wide real state root
+# (/tmp/pf-rust-ci-<uid>) with live CI jobs: bind state_root to the test's
+# private STUB_STATE directory, failing closed with a KeyError when it is
+# absent. The fixture-admission wait is short and explicit so that even a
+# regression re-exposing a shared lock fails as a typed
+# control_fixture_timeout refusal well inside the test's 240s subprocess
+# timeout instead of starving it (pocketforge-automation#1460).
+STUB_STATE = Path(os.environ["STUB_STATE"])
+ci.state_root = lambda: STUB_STATE
+ci.SLOT_WAIT_SECONDS = 30.0
+
 
 def checked(*args, **kwargs):
     if args[0] == "docker":
