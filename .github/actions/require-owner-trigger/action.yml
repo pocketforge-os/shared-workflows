@@ -1,0 +1,30 @@
+name: Require owner trigger
+description: Fail closed unless both the original and current run actors resolve to the PocketForge owner
+inputs:
+  github-token:
+    description: Job GITHUB_TOKEN; permissions may be empty because the user endpoint is public
+    required: true
+  triggering-actor:
+    description: Untrusted github.triggering_actor value
+    required: true
+  actor-id:
+    description: Untrusted immutable github.actor_id value for the original run
+    required: true
+  required-login:
+    description: Expected canonical owner login
+    required: true
+  required-id:
+    description: Expected immutable owner account ID
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Authorize owner-triggered privileged run
+      shell: bash
+      env:
+        GATE_GITHUB_TOKEN: ${{ inputs.github-token }}
+        GATE_TRIGGERING_ACTOR: ${{ inputs.triggering-actor }}
+        GATE_ACTOR_ID: ${{ inputs.actor-id }}
+        GATE_REQUIRED_LOGIN: ${{ inputs.required-login }}
+        GATE_REQUIRED_ID: ${{ inputs.required-id }}
+      run: python3 "$GITHUB_ACTION_PATH/require-owner-trigger.py"

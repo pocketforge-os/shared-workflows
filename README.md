@@ -10,6 +10,7 @@ Public repo so **every** repo in the org — private *or* public — can `uses:`
 |---|---|
 | `.github/workflows/pr-review-gate.yml` | Reusable — the 3-phase opencode peer-review gate (tsp-8ny). Runs on the `pf-pr-review` self-hosted lab runner. Exit 0 → check pass, 4 → blocking findings, 2 → workflow failure. |
 | `.github/workflows/pr-review.yml` | Thin caller for **this** repo — dogfoods `pr-review-gate.yml` on its own PRs via the local `./` path. |
+| `.github/actions/require-owner-trigger` | Composite authorization gate for privileged jobs. It validates the original actor ID and current triggering login, then resolves that login through GitHub's public user API using the job token. Pin callers to a reviewed commit. |
 
 ## Using it in another repo
 

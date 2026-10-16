@@ -1,0 +1,37 @@
+name: Owner trigger action test
+
+on:
+  pull_request:
+    paths:
+      - .github/actions/require-owner-trigger/**
+      - .github/workflows/require-owner-trigger-test.yml
+      - tests/test_require_owner_trigger.py
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/require-owner-trigger/**
+      - .github/workflows/require-owner-trigger-test.yml
+      - tests/test_require_owner_trigger.py
+
+permissions: {}
+
+jobs:
+  test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, pf-ci-container]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout public action source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Run adversarial controls
+        run: python3 tests/test_require_owner_trigger.py
+      - name: Verify public user lookup with an empty-permission GITHUB_TOKEN
+        uses: ./.github/actions/require-owner-trigger
+        with:
+          github-token: ${{ github.token }}
+          triggering-actor: Burke9077
+          actor-id: '6282442'
+          required-login: Burke9077
+          required-id: '6282442'
