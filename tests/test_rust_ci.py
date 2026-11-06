@@ -24,6 +24,8 @@ spec.loader.exec_module(ci)
 
 CI_RUST_IMAGE = "10.0.32.86:5555/pocketforge/ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9"
 CI_TOOLS_IMAGE = "10.0.32.86:5555/pocketforge/ci-tools@sha256:2ff536627228c90e5c32b7d6345b21600a38a17481c075b41683db47ead3e862"
+CI_RUST_IMAGE_APT_FIXED = "10.0.32.86:5555/pocketforge/ci-rust@sha256:5c2daa0b955ec5cfe56dff8d90773b5b2c3b6693629955d22935642fe45663f0"
+CI_TOOLS_IMAGE_APT_FIXED = "10.0.32.86:5555/pocketforge/ci-tools@sha256:ec1c841c5ed3a29548f77c4656b05e7926feb458b3966cbc34449044294d8069"
 
 
 def hold_lock(path, ready):
@@ -294,14 +296,23 @@ class CapacityTests(unittest.TestCase):
                        "10.0.32.86:5555/pocketforge/ci-rust:latest", "ci.sh")
             engine.assert_not_called()
 
-    def test_image_allowlist_accepts_two_exact_digests_only(self):
-        for image in (CI_RUST_IMAGE, CI_TOOLS_IMAGE):
+    def test_image_allowlist_accepts_four_exact_digests_only(self):
+        admitted = (CI_RUST_IMAGE, CI_TOOLS_IMAGE, CI_RUST_IMAGE_APT_FIXED, CI_TOOLS_IMAGE_APT_FIXED)
+        for image in admitted:
             with self.subTest(image=image):
                 ci.verify_image(image)
+        self.assertEqual(ci.ALLOWED_IMAGES, frozenset(admitted))
+        self.assertEqual(len(ci.ALLOWED_IMAGES), 4)
+        # The rust controls accept ci-rust digests only, never a ci-tools one.
+        self.assertEqual(ci.CI_RUST_IMAGES, frozenset((CI_RUST_IMAGE, CI_RUST_IMAGE_APT_FIXED)))
+        self.assertEqual(ci.CI_TOOLS_IMAGES, frozenset((CI_TOOLS_IMAGE, CI_TOOLS_IMAGE_APT_FIXED)))
+        self.assertFalse(ci.CI_RUST_IMAGES & ci.CI_TOOLS_IMAGES)
+
+        def one_digit_off(image):
+            return image[:-1] + ("1" if image.endswith("0") else "0")
 
         refused = (
-            CI_RUST_IMAGE[:-1] + "0",
-            CI_TOOLS_IMAGE[:-1] + "0",
+            *(one_digit_off(image) for image in admitted),
             "10.0.32.86:5555/pocketforge/ci-tools:latest",
             "10.0.32.86:5555/pocketforge/other@sha256:" + "a" * 64,
         )

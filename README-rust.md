@@ -19,6 +19,11 @@ The allowlist is deliberately exact, not a repository-shaped regular expression:
 
 - `ci-rust@sha256:801f15f7e8fd20b449e3b0d0a7a56d632e28dae825b251a19a30e6f8b32bd8e9`
 - `ci-tools@sha256:2ff536627228c90e5c32b7d6345b21600a38a17481c075b41683db47ead3e862`
+- `ci-rust@sha256:5c2daa0b955ec5cfe56dff8d90773b5b2c3b6693629955d22935642fe45663f0`
+- `ci-tools@sha256:ec1c841c5ed3a29548f77c4656b05e7926feb458b3966cbc34449044294d8069`
+
+The last two are the same recipes rebuilt with apt patched for CVE-2026-109518
+(tsp-hqm1p.143). The first two stay admitted until every caller has moved.
 
 The latter supplies Python, librsvg/fontconfig and xcursorgen for design payloads.
 Any other digest, repository or tag is refused before the container engine runs.

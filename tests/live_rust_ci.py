@@ -138,7 +138,7 @@ def main():
     p.add_argument("--image", required=True)
     p.add_argument("--wait-seconds", type=float, default=ci.SLOT_WAIT_SECONDS)
     args = p.parse_args()
-    if args.image != ci.CI_RUST_IMAGE:
+    if args.image not in ci.CI_RUST_IMAGES:
         raise ci.Refused("rust_controls_require_ci_rust")
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, ci.interrupted)
